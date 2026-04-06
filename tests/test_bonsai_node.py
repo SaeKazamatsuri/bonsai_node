@@ -200,30 +200,27 @@ class BonsaiNodeTests(unittest.TestCase):
 
         self.assertEqual(normalized, ["simple_background", "black_background"])
 
-    def test_underwear_prompt_filters_outerwear_candidates_before_llm(self) -> None:
+    def test_candidate_filter_limits_clothing_family_variants(self) -> None:
         candidates = [
             make_result("1girl"),
-            make_result("underwear"),
-            make_result("bra"),
-            make_result("panties"),
             make_result("dress"),
+            make_result("pink_dress"),
+            make_result("short_dress"),
+            make_result("long_dress"),
             make_result("skirt"),
-            make_result("shirt"),
-            make_result("bikini"),
-            make_result("thighhighs"),
-            make_result("pantyhose"),
-            make_result("small_breasts"),
-            make_result("between_breasts"),
+            make_result("pleated_skirt"),
+            make_result("frilled_skirt"),
+            make_result("black_hair"),
         ]
 
         filtered = MODULE.BonsaiCsvTagSelectorNode._filter_candidates_for_prompt(
-            instruction_ja="下着姿の女の子",
+            instruction_ja="女の子を描く",
             candidates=candidates,
         )
 
         self.assertEqual(
             [item.metadata.name for item in filtered],
-            ["1girl", "underwear", "bra", "panties"],
+            ["1girl", "dress", "pink_dress", "skirt", "pleated_skirt", "black_hair"],
         )
 
     def test_underwear_prompt_prunes_conflicting_clothes_and_composition(self) -> None:
@@ -261,6 +258,40 @@ class BonsaiNodeTests(unittest.TestCase):
         )
 
         self.assertEqual(normalized, ["1girl", "full_body", "bra", "panties", "underwear"])
+
+    def test_dress_prompt_prunes_conflicting_clothes_and_keeps_single_legwear_family(self) -> None:
+        candidate_tags = [
+            "1girl",
+            "dress",
+            "pink_dress",
+            "short_dress",
+            "skirt",
+            "shirt",
+            "bra",
+            "panties",
+            "bikini",
+            "thighhighs",
+            "pantyhose",
+            "full_body",
+            "upper_body",
+        ]
+        candidate_results = [make_result(tag) for tag in candidate_tags]
+        metadata_by_tag = {item.metadata.name: item.metadata for item in candidate_results}
+        fake_catalog = FakeCatalog(candidate_results)
+
+        normalized = MODULE.BonsaiCsvTagSelectorNode._normalize_selected_tags(
+            text=(
+                "Prompt: 1girl, full body, upper body, dress, pink dress, short dress, "
+                "skirt, shirt, bra, panties, bikini, thighhighs, pantyhose"
+            ),
+            instruction_ja="ピンクのドレス姿の女の子",
+            candidate_tags=candidate_tags,
+            metadata_by_tag=metadata_by_tag,
+            max_selected_tags=16,
+            catalog=fake_catalog,
+        )
+
+        self.assertEqual(normalized, ["1girl", "full_body", "dress", "pink_dress", "short_dress", "thighhighs"])
 
     def test_selector_returns_bucketed_deepdanbooru_like_output(self) -> None:
         candidates = [

@@ -96,11 +96,27 @@ INSTRUCTION_CONCEPT_ALIASES: dict[str, tuple[str, ...]] = {
     "bra": ("ブラ", "ブラジャー", "bra"),
     "panties": ("パンツ", "パンティ", "パンティー", "ショーツ", "panties"),
     "dress": ("ドレス", "ワンピース", "dress"),
+    "kimono": ("着物", "kimono"),
+    "leotard": ("レオタード", "leotard"),
+    "bodysuit": ("ボディスーツ", "bodysuit"),
     "shirt": ("シャツ", "shirt"),
+    "jacket": ("ジャケット", "jacket"),
+    "coat": ("コート", "coat"),
+    "hoodie": ("パーカー", "hoodie"),
+    "sweater": ("セーター", "sweater"),
+    "cardigan": ("カーディガン", "cardigan"),
+    "serafuku": ("セーラー服", "serafuku", "sailor uniform"),
+    "suit": ("スーツ", "suit"),
     "skirt": ("スカート", "skirt"),
+    "shorts": ("ショートパンツ", "shorts"),
+    "buruma": ("ブルマ", "buruma"),
     "swimwear": ("水着", "ビキニ", "swimsuit", "bikini"),
+    "socks": ("靴下", "socks"),
     "thighhighs": ("ニーハイ", "thighhighs"),
     "pantyhose": ("パンスト", "ストッキング", "パンティストッキング", "pantyhose"),
+    "shoes": ("靴", "shoes"),
+    "boots": ("ブーツ", "boots"),
+    "sandals": ("サンダル", "sandals"),
     "full_body": ("全身", "全身像", "full body"),
     "upper_body": ("上半身", "バストアップ", "upper body"),
     "sitting": ("座り", "座って", "sitting"),
@@ -112,7 +128,47 @@ INSTRUCTION_CONCEPT_ALIASES: dict[str, tuple[str, ...]] = {
     "huge_breasts": ("爆乳", "huge breasts"),
     "gigantic_breasts": ("超爆乳", "gigantic breasts"),
 }
-UNDERWEAR_THEME_ALLOWED_FAMILIES: frozenset[str] = frozenset({"underwear", "bra", "panties"})
+CLOTHING_SLOT_CANDIDATE_FAMILY_LIMITS: dict[str, int] = {
+    "full_outfit": 2,
+    "swimwear": 1,
+    "coordinated_outfit": 1,
+    "top": 2,
+    "bottom": 2,
+    "outerwear": 1,
+    "undergarment": 1,
+    "undergarment_top": 1,
+    "undergarment_bottom": 1,
+    "legwear": 1,
+    "footwear": 1,
+    "clothing_detail": 2,
+}
+CLOTHING_SLOT_OUTPUT_FAMILY_LIMITS: dict[str, int] = {
+    "full_outfit": 1,
+    "swimwear": 1,
+    "coordinated_outfit": 1,
+    "top": 1,
+    "bottom": 1,
+    "outerwear": 1,
+    "undergarment": 1,
+    "undergarment_top": 1,
+    "undergarment_bottom": 1,
+    "legwear": 1,
+    "footwear": 1,
+    "clothing_detail": 2,
+}
+CLOTHING_FAMILY_CANDIDATE_LIMIT = 2
+EXPLICIT_CLOTHING_FAMILY_CANDIDATE_LIMIT = 4
+CLOTHING_FAMILY_OUTPUT_LIMIT = 2
+EXPLICIT_CLOTHING_FAMILY_OUTPUT_LIMIT = 3
+DOMINANT_CLOTHING_MODE_CONFLICT_SLOTS: dict[str, frozenset[str]] = {
+    "full_outfit": frozenset(
+        {"coordinated_outfit", "top", "bottom", "swimwear", "undergarment", "undergarment_top", "undergarment_bottom"}
+    ),
+    "swimwear": frozenset(
+        {"full_outfit", "coordinated_outfit", "top", "bottom", "undergarment", "undergarment_top", "undergarment_bottom"}
+    ),
+    "undergarment": frozenset({"full_outfit", "coordinated_outfit", "top", "bottom", "swimwear"}),
+}
 STRICT_TAG_DENYLIST: frozenset[str] = frozenset(
     {
         "quality",
@@ -360,17 +416,55 @@ def _instruction_mentions_concept(instruction_ja: str, concept: str) -> bool:
     return _instruction_mentions_aliases(instruction_ja, aliases)
 
 
-def _instruction_requests_underwear_theme(instruction_ja: str) -> bool:
-    return any(
-        _instruction_mentions_concept(instruction_ja, concept)
-        for concept in ("underwear", "underwear_only", "bra", "panties")
-    )
-
-
 def _is_specific_breast_detail_tag(tag: str) -> bool:
     if tag == "breasts" or tag in BREAST_SIZE_TAGS:
         return False
     return tag.endswith("_breasts")
+
+
+def _classify_clothing_slot(family: str) -> str:
+    if family in {"dress", "kimono", "leotard", "bodysuit"}:
+        return "full_outfit"
+    if family == "swimwear":
+        return "swimwear"
+    if family in {"serafuku", "suit"}:
+        return "coordinated_outfit"
+    if family in {"shirt", "hoodie", "sweater", "vest"}:
+        return "top"
+    if family in {"jacket", "coat", "cardigan", "cloak", "cape"}:
+        return "outerwear"
+    if family in {"skirt", "pants", "shorts", "buruma"}:
+        return "bottom"
+    if family == "underwear":
+        return "undergarment"
+    if family == "bra":
+        return "undergarment_top"
+    if family == "panties":
+        return "undergarment_bottom"
+    if family in {"thighhighs", "pantyhose", "socks"}:
+        return "legwear"
+    if family in {"shoes", "boots", "sandals"}:
+        return "footwear"
+    return "clothing_detail"
+
+
+def _clothing_mode_from_family(family: str) -> str | None:
+    slot = _classify_clothing_slot(family)
+    if slot in {"full_outfit", "swimwear"}:
+        return slot
+    if slot in {"undergarment", "undergarment_top", "undergarment_bottom"}:
+        return "undergarment"
+    return None
+
+
+def _clothing_family_variant_limit(slot: str, explicit: bool, for_candidate: bool) -> int:
+    if slot in {"undergarment", "undergarment_top", "undergarment_bottom", "swimwear", "legwear", "footwear"}:
+        return 1
+    if slot == "outerwear":
+        return 2 if explicit else 1
+    if for_candidate:
+        return EXPLICIT_CLOTHING_FAMILY_CANDIDATE_LIMIT if explicit else CLOTHING_FAMILY_CANDIDATE_LIMIT
+    return EXPLICIT_CLOTHING_FAMILY_OUTPUT_LIMIT if explicit else CLOTHING_FAMILY_OUTPUT_LIMIT
 
 
 def _require_numpy() -> object:
@@ -434,15 +528,21 @@ def _instruction_mentions_text(instruction_ja: str, text: str) -> bool:
     return text.casefold() in instruction_ja.casefold()
 
 
-def _instruction_explicitly_mentions_tag(instruction_ja: str, metadata: TagMetadata) -> bool:
-    if _instruction_mentions_text(instruction_ja, metadata.name):
+def _instruction_explicitly_mentions_tag_name(instruction_ja: str, tag: str) -> bool:
+    if _instruction_mentions_text(instruction_ja, tag):
         return True
-    if _instruction_mentions_text(instruction_ja, _display_tag(metadata.name)):
+    if _instruction_mentions_text(instruction_ja, _display_tag(tag)):
         return True
-    if _instruction_mentions_concept(instruction_ja, metadata.name):
+    if _instruction_mentions_concept(instruction_ja, tag):
         return True
-    clothing_family = _extract_clothing_family(metadata.name)
+    clothing_family = _extract_clothing_family(tag)
     if clothing_family is not None and _instruction_mentions_concept(instruction_ja, clothing_family):
+        return True
+    return False
+
+
+def _instruction_explicitly_mentions_tag(instruction_ja: str, metadata: TagMetadata) -> bool:
+    if _instruction_explicitly_mentions_tag_name(instruction_ja, metadata.name):
         return True
     words_text = " ".join(metadata.words)
     return _instruction_mentions_text(instruction_ja, words_text)
@@ -531,14 +631,6 @@ def _should_allow_metadata_by_default(instruction_ja: str, metadata: TagMetadata
         return False
     if _is_specific_breast_detail_tag(metadata.name) and not _instruction_explicitly_mentions_tag(instruction_ja, metadata):
         return False
-    clothing_family = _extract_clothing_family(metadata.name)
-    if (
-        clothing_family is not None
-        and _instruction_requests_underwear_theme(instruction_ja)
-        and clothing_family not in UNDERWEAR_THEME_ALLOWED_FAMILIES
-        and not _instruction_explicitly_mentions_tag(instruction_ja, metadata)
-    ):
-        return False
     if metadata.category in EXPLICIT_ONLY_CATEGORIES and not _instruction_explicitly_mentions_tag(instruction_ja, metadata):
         return False
     return True
@@ -616,26 +708,87 @@ def _filter_pose_conflicts(ordered_selected_tags: list[str]) -> list[str]:
     return kept_tags
 
 
-def _filter_underwear_theme_conflicts(ordered_selected_tags: list[str], instruction_ja: str) -> list[str]:
-    if not _instruction_requests_underwear_theme(instruction_ja):
-        return ordered_selected_tags
+def _limit_clothing_candidates(instruction_ja: str, candidates: list[TagSearchResult]) -> list[TagSearchResult]:
+    kept_candidates: list[TagSearchResult] = []
+    family_counts: dict[str, int] = {}
+    slot_families: dict[str, set[str]] = {}
+    for item in candidates:
+        family = _extract_clothing_family(item.metadata.name)
+        if family is None:
+            kept_candidates.append(item)
+            continue
+        explicit = _instruction_explicitly_mentions_tag(instruction_ja, item.metadata)
+        slot = _classify_clothing_slot(family)
+        family_limit = _clothing_family_variant_limit(slot, explicit=explicit, for_candidate=True)
+        current_family_count = family_counts.get(family, 0)
+        if current_family_count >= family_limit:
+            continue
+        slot_limit = CLOTHING_SLOT_CANDIDATE_FAMILY_LIMITS.get(slot, 2)
+        slot_seen_families = slot_families.setdefault(slot, set())
+        if family not in slot_seen_families and len(slot_seen_families) >= slot_limit and not explicit:
+            continue
+        slot_seen_families.add(family)
+        family_counts[family] = current_family_count + 1
+        kept_candidates.append(item)
+    return kept_candidates
 
-    kept_tags: list[str] = []
-    seen_underwear_families: set[str] = set()
+
+def _infer_dominant_clothing_mode(ordered_selected_tags: list[str], instruction_ja: str) -> str | None:
+    explicit_modes: list[str] = []
+    seen_modes: list[str] = []
     for tag in ordered_selected_tags:
-        clothing_family = _extract_clothing_family(tag)
-        if clothing_family is None:
+        family = _extract_clothing_family(tag)
+        if family is None:
+            continue
+        mode = _clothing_mode_from_family(family)
+        if mode is None:
+            continue
+        if mode not in seen_modes:
+            seen_modes.append(mode)
+        if _instruction_explicitly_mentions_tag_name(instruction_ja, tag) and mode not in explicit_modes:
+            explicit_modes.append(mode)
+    if explicit_modes:
+        return explicit_modes[0]
+    if seen_modes:
+        return seen_modes[0]
+    return None
+
+
+def _filter_clothing_conflicts(ordered_selected_tags: list[str], instruction_ja: str) -> list[str]:
+    dominant_mode = _infer_dominant_clothing_mode(ordered_selected_tags, instruction_ja)
+    kept_tags: list[str] = []
+    family_counts: dict[str, int] = {}
+    slot_families: dict[str, set[str]] = {}
+    for tag in ordered_selected_tags:
+        family = _extract_clothing_family(tag)
+        if family is None:
             kept_tags.append(tag)
             continue
-        if (
-            clothing_family not in UNDERWEAR_THEME_ALLOWED_FAMILIES
-            and not _instruction_mentions_concept(instruction_ja, clothing_family)
-        ):
-            continue
-        if clothing_family in UNDERWEAR_THEME_ALLOWED_FAMILIES:
-            if clothing_family in seen_underwear_families:
+        explicit = _instruction_explicitly_mentions_tag_name(instruction_ja, tag)
+        slot = _classify_clothing_slot(family)
+        mode = _clothing_mode_from_family(family)
+
+        if dominant_mode is not None:
+            if mode is not None and mode != dominant_mode and not explicit:
                 continue
-            seen_underwear_families.add(clothing_family)
+            conflict_slots = DOMINANT_CLOTHING_MODE_CONFLICT_SLOTS.get(dominant_mode, frozenset())
+            if slot in conflict_slots and mode != dominant_mode and not explicit:
+                continue
+            if dominant_mode in {"swimwear", "undergarment"} and slot in {"legwear", "footwear"} and not explicit:
+                continue
+
+        family_limit = _clothing_family_variant_limit(slot, explicit=explicit, for_candidate=False)
+        current_family_count = family_counts.get(family, 0)
+        if current_family_count >= family_limit:
+            continue
+
+        slot_limit = CLOTHING_SLOT_OUTPUT_FAMILY_LIMITS.get(slot, 2)
+        slot_seen_families = slot_families.setdefault(slot, set())
+        if family not in slot_seen_families and len(slot_seen_families) >= slot_limit and not explicit:
+            continue
+
+        slot_seen_families.add(family)
+        family_counts[family] = current_family_count + 1
         kept_tags.append(tag)
     return kept_tags
 
@@ -1185,8 +1338,9 @@ class BonsaiCsvTagSelectorNode:
             and (not _is_low_signal_tag(item.metadata.name) or _instruction_explicitly_mentions_tag(instruction_ja, item.metadata))
         ]
         if filtered:
-            return filtered
-        return [item for item in candidates if not _is_denied_by_strict_policy(item.metadata.name)]
+            return _limit_clothing_candidates(instruction_ja, filtered)
+        fallback = [item for item in candidates if not _is_denied_by_strict_policy(item.metadata.name)]
+        return _limit_clothing_candidates(instruction_ja, fallback)
 
     @classmethod
     def _chat_with_retry(
@@ -1279,7 +1433,8 @@ class BonsaiCsvTagSelectorNode:
             "- 候補一覧にあるタグだけを使う\n"
             "- 指示に直接関係するタグだけを選ぶ\n"
             "- 指示にない胸サイズや胸まわりの細部タグは補完しない\n"
-            "- 同じ部位に競合する衣装タグを同時に選ばない\n"
+            "- 服装は一貫した1コーデとして組み、同時に成立しにくい衣装カテゴリを混在させない\n"
+            "- 同じ服ファミリの派生タグは必要最小限に絞る\n"
             "- full_body と upper_body のような競合構図タグを同時に選ばない\n"
             "- 品質タグ、画風タグ、artist/meta タグは明示要求がない限り選ばない\n"
             "- 人数/主題 -> 版権/キャラ -> 身体属性 -> 顔/目線 -> 髪/頭部 -> 服/装飾 -> ポーズ/構図 -> 背景の順で考える\n"
@@ -1374,7 +1529,7 @@ class BonsaiCsvTagSelectorNode:
         filtered_tags = _filter_background_conflicts(filtered_tags)
         filtered_tags = _filter_breast_size_conflicts(filtered_tags)
         filtered_tags = _filter_pose_conflicts(filtered_tags)
-        filtered_tags = _filter_underwear_theme_conflicts(filtered_tags, instruction_ja=instruction_ja)
+        filtered_tags = _filter_clothing_conflicts(filtered_tags, instruction_ja=instruction_ja)
         filtered_tags = _filter_subject_conflicts(filtered_tags)
         ordered_output = _apply_output_bucket_order(
             ordered_selected_tags=filtered_tags,
