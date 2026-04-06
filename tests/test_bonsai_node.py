@@ -122,7 +122,7 @@ class BonsaiNodeTests(unittest.TestCase):
             make_result("quality"),
         ]
         fake_catalog = FakeCatalog(candidates)
-        fake_manager = FakeManager("masterpiece, 1girl, solo, blush, brown hair, simple background, black background, quality")
+        fake_manager = FakeManager("Prompt: masterpiece, 1girl, solo, blush, brown hair, simple background, black background, quality")
 
         with patch.object(MODULE.TagEmbeddingCatalog, "instance", return_value=fake_catalog), patch.object(
             MODULE.BonsaiServerManager, "instance", return_value=fake_manager
@@ -147,7 +147,7 @@ class BonsaiNodeTests(unittest.TestCase):
         fake_catalog = FakeCatalog([make_result(tag) for tag in candidate_tags], existing_tags={"1girl", "blush", "brown_hair"})
 
         normalized = MODULE.BonsaiCsvTagSelectorNode._normalize_selected_tags(
-            text="1girl, 1girl, best quality, unknown tag, blush, brown hair",
+            text="Prompt: 1girl, 1girl, best quality, unknown tag, blush, brown hair",
             instruction_ja="女の子を描く",
             candidate_tags=candidate_tags,
             metadata_by_tag=metadata_by_tag,
@@ -219,7 +219,7 @@ class BonsaiNodeTests(unittest.TestCase):
         ]
         fake_catalog = FakeCatalog(candidates)
         fake_manager = FakeManager(
-            "quality, black shirt, bra, navel, black background, shirt lift, 1girl, solo, blush, brown hair, short hair, panties, wariza, simple background"
+            "Prompt: quality, black shirt, bra, navel, black background, shirt lift, 1girl, solo, blush, brown hair, short hair, panties, wariza, simple background"
         )
 
         with patch.object(MODULE.TagEmbeddingCatalog, "instance", return_value=fake_catalog), patch.object(

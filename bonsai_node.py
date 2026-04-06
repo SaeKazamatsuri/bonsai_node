@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 
 def _normalize_tags(text: str) -> str:
     normalized = text.replace("\r", " ").replace("\n", " ").strip()
+    normalized = re.sub(r"(?i)^prompt\s*:\s*", "", normalized)
     return ",".join(part.strip() for part in normalized.split(",") if part.strip())
 
 
@@ -252,6 +253,21 @@ OUTPUT_BUCKET_ORDER: tuple[str, ...] = (
     "background",
 )
 SUBJECT_COUNT_PATTERN = re.compile(r"^(?P<count>\d+)(girl|girls|boy|boys|other|others)$")
+SDXL_DANBOORU_SYSTEM_PROMPT = (
+    "あなたは、Stable Diffusion XL（SDXL）向けのプロンプトを生成する専門エージェントです。"
+    "Danbooruタグ形式をベースに、構造化されたタグ列のみを出力してください。"
+    "目的: Danbooruタグに準拠した、明確で再現性の高いプロンプトを生成し、不要な修飾（品質・レンダリング・雰囲気）を排除して純粋な構造情報のみを記述すること。"
+    "出力形式は必ず `Prompt: <tag1>, <tag2>, <tag3>, ...` としてください。"
+    "ネガティブプロンプトは禁止です。"
+    "masterpiece, best_quality, high_quality などの品質タグは禁止です。"
+    "cinematic_lighting, depth_of_field, volumetric_lighting などのレンダリング表現は禁止です。"
+    "beautiful, cute, aesthetic などの抽象的・主観的表現は禁止です。"
+    "自然言語の文章は禁止です。"
+    "タグはすべて英語、lowercase、単語区切りはアンダースコア、カンマ区切りにしてください。"
+    "重要度の高い順に並べ、1girl, 1boy などの主体タグは必ず先頭に配置してください。"
+    "タグ構造は、1. 主体 2. キャラクター属性 3. 表情 4. 服装 5. ポーズ・動作 6. 構図 7. 背景・場所 の順に従ってください。"
+    "ユーザーの入力が曖昧な場合は一般的なDanbooruタグに補完し、存在しないタグは作らず既存タグに近似し、冗長なタグは避けて簡潔にまとめてください。"
+)
 
 
 def _validate_instruction(instruction_ja: str) -> str:
@@ -897,12 +913,11 @@ class BonsaiCsvTagSelectorNode:
     CONTEXT_MARGIN_TOKENS = 256
     MIN_CANDIDATE_COUNT = 8
     DEFAULT_SYSTEM_PROMPT = (
-        "あなたは DeepDanbooru / Danbooru 形式のタグ選別アシスタントです。"
-        "必ず候補一覧に含まれるタグだけを選んでください。"
-        "候補にないタグを新規生成してはいけません。"
-        "出力は1行のカンマ区切りタグのみとし、説明文、番号、改行、前置きは禁止です。"
-        "品質タグ、画風タグ、artist/meta タグは、指示で明示されない限り選んではいけません。"
-        "題材に直接関係するタグだけを選び、人物属性、顔髪、服、ポーズ、背景を必要な範囲で過不足なく構成してください。"
+        SDXL_DANBOORU_SYSTEM_PROMPT
+        + " 必ず候補一覧に含まれるタグだけを選んでください。"
+        + " 候補にないタグを新規生成してはいけません。"
+        + " qualityタグ、画風タグ、artist/metaタグは、指示で明示されない限り選んではいけません。"
+        + " 題材に直接関係するタグだけを選び、人物属性、顔髪、服、ポーズ、背景を必要な範囲で過不足なく構成してください。"
     )
 
     @classmethod
@@ -1132,7 +1147,7 @@ class BonsaiCsvTagSelectorNode:
             "- 指示に直接関係するタグだけを選ぶ\n"
             "- 品質タグ、画風タグ、artist/meta タグは明示要求がない限り選ばない\n"
             "- 人数/主題 -> 版権/キャラ -> 身体属性 -> 顔/目線 -> 髪/頭部 -> 服/装飾 -> ポーズ/構図 -> 背景の順で考える\n"
-            "- 出力は1行のカンマ区切りタグのみ\n"
+            "- 出力は `Prompt: tag1, tag2, ...` の1行のみ\n"
             "- category や post_count は参考情報であり、出力には含めない\n"
             f"{auxiliary_section}"
             "候補一覧:\n"
@@ -1261,10 +1276,7 @@ class BonsaiChatNode:
     DEFAULT_MAX_CANDIDATES = 256
     DEFAULT_MAX_SELECTED_TAGS = 32
     DEFAULT_CATEGORY_PROFILE = "balanced"
-    DEFAULT_SYSTEM_PROMPT = (
-        "DeepDanbooru 風に、題材へ直接関係する tags.json 内のタグだけを優先してください。"
-        "品質タグ、画風タグ、不要な補助語は入れず、主題から背景まで筋の通ったタグ列にしてください。"
-    )
+    DEFAULT_SYSTEM_PROMPT = SDXL_DANBOORU_SYSTEM_PROMPT
 
     @classmethod
     def INPUT_TYPES(cls) -> dict[str, dict[str, tuple[str, dict[str, object]]]]:
