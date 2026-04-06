@@ -1623,3 +1623,76 @@ class BonsaiChatNode:
         if not stripped or stripped == cls.DEFAULT_SYSTEM_PROMPT:
             return None
         return stripped
+
+
+class BonsaiDirectTagGeneratorNode:
+    CATEGORY = "LLM/Bonsai"
+    FUNCTION = "run"
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("tags",)
+
+    DEFAULT_SYSTEM_PROMPT = SDXL_DANBOORU_SYSTEM_PROMPT
+
+    @classmethod
+    def INPUT_TYPES(cls) -> dict[str, dict[str, tuple[str, dict[str, object]]]]:
+        return {
+            "required": {
+                "instruction_ja": ("STRING", {"multiline": True, "default": ""}),
+                "system_prompt": (
+                    "STRING",
+                    {"multiline": True, "default": cls.DEFAULT_SYSTEM_PROMPT},
+                ),
+                "temperature": (
+                    "FLOAT",
+                    {"default": 0.4, "min": 0.0, "max": 2.0, "step": 0.1},
+                ),
+                "max_tokens": ("INT", {"default": 128, "min": 1, "max": 2048}),
+                "top_p": (
+                    "FLOAT",
+                    {"default": 0.9, "min": 0.0, "max": 1.0, "step": 0.01},
+                ),
+                "top_k": ("INT", {"default": 20, "min": 1, "max": 200}),
+            }
+        }
+
+    def run(
+        self,
+        instruction_ja: str,
+        system_prompt: str,
+        temperature: float,
+        max_tokens: int,
+        top_p: float,
+        top_k: int,
+    ) -> tuple[str]:
+        stripped_instruction = _validate_instruction(instruction_ja)
+        manager = BonsaiServerManager.instance()
+        text = manager.chat(
+            system_prompt=self._normalize_system_prompt(system_prompt),
+            user_prompt=stripped_instruction,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            top_p=top_p,
+            top_k=top_k,
+        )
+        return (self._normalize_generated_tags(text),)
+
+    @classmethod
+    def _normalize_system_prompt(cls, system_prompt: str) -> str:
+        stripped = system_prompt.strip()
+        if not stripped:
+            return cls.DEFAULT_SYSTEM_PROMPT
+        return stripped
+
+    @staticmethod
+    def _normalize_generated_tags(text: str) -> str:
+        normalized_tags: list[str] = []
+        seen: set[str] = set()
+        for tag in _split_tags(text):
+            canonical_tag = _normalized_tag_key(tag)
+            if not canonical_tag or canonical_tag in seen:
+                continue
+            seen.add(canonical_tag)
+            normalized_tags.append(_display_tag(canonical_tag))
+        if not normalized_tags:
+            raise RuntimeError("Bonsai から有効なタグ出力を取得できませんでした。")
+        return ",".join(normalized_tags)

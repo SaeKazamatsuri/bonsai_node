@@ -111,6 +111,28 @@ def make_result(name: str, category: int = 0, post_count: int = 1000) -> object:
 
 
 class BonsaiNodeTests(unittest.TestCase):
+    def test_direct_tag_generator_uses_bonsai_only(self) -> None:
+        fake_manager = FakeManager("Prompt: 1girl, blush, brown_hair, blush")
+
+        with patch.object(MODULE.BonsaiServerManager, "instance", return_value=fake_manager), patch.object(
+            MODULE.TagEmbeddingCatalog,
+            "instance",
+            side_effect=AssertionError("TagEmbeddingCatalog should not be used"),
+        ):
+            node = MODULE.BonsaiDirectTagGeneratorNode()
+            result = node.run(
+                instruction_ja="頬を赤らめた女の子",
+                system_prompt=MODULE.SDXL_DANBOORU_SYSTEM_PROMPT,
+                temperature=0.4,
+                max_tokens=128,
+                top_p=0.9,
+                top_k=20,
+            )
+
+        self.assertEqual(result, ("1girl,blush,brown hair",))
+        self.assertEqual(fake_manager.calls[0]["system_prompt"], MODULE.SDXL_DANBOORU_SYSTEM_PROMPT)
+        self.assertEqual(fake_manager.calls[0]["user_prompt"], "頬を赤らめた女の子")
+
     def test_chat_node_uses_strict_selection_pipeline(self) -> None:
         candidates = [
             make_result("1girl"),

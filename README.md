@@ -40,6 +40,28 @@ python .\main.py
 
 ## ノード
 
+### Bonsai Direct Tag Generator
+
+ComfyUI 上では `Bonsai Direct Tag Generator` として表示されます。
+
+入力:
+
+- `instruction_ja`: 日本語の指示文
+- `system_prompt`: 既存の SDXL / Danbooru 向けシステムプロンプトを既定値として流用
+- `temperature`
+- `max_tokens`
+- `top_p`
+- `top_k`
+
+出力:
+
+- `tags`: 1 行のカンマ区切りタグ
+
+想定用途:
+
+- `tags.json` や埋め込み索引を使わず、Bonsai のみでタグ列を生成する
+- 既存のシステムプロンプトをそのまま使って、軽量にタグ生成したい
+
 ### Bonsai Tag Generator
 
 ComfyUI 上では `Bonsai Tag Generator` として表示されます。
@@ -95,6 +117,7 @@ ComfyUI 上では `Bonsai Semantic Tag Selector` として表示されます。
 
 既存ノードとの違い:
 
+- `Bonsai Direct Tag Generator` は `tags.json` を使わず、Bonsai に直接タグ生成させます
 - `Bonsai Tag Generator` は簡易インターフェースで strict pipeline を使います
 - `Bonsai Semantic Tag Selector` は候補数やカテゴリ重みを調整できる詳細版です
 
