@@ -54,6 +54,8 @@ CLOTHING_TERMS: tuple[str, ...] = (
     "kimono",
     "serafuku",
     "suit",
+    "underwear",
+    "underwear_only",
     "bra",
     "sports_bra",
     "panties",
@@ -81,6 +83,36 @@ CLOTHING_TERMS: tuple[str, ...] = (
     "bikini",
     "one-piece_swimsuit",
 )
+SORTED_CLOTHING_TERMS: tuple[str, ...] = tuple(sorted(CLOTHING_TERMS, key=len, reverse=True))
+CANONICAL_CLOTHING_FAMILIES: dict[str, str] = {
+    "underwear_only": "underwear",
+    "sports_bra": "bra",
+    "bikini": "swimwear",
+    "one-piece_swimsuit": "swimwear",
+}
+INSTRUCTION_CONCEPT_ALIASES: dict[str, tuple[str, ...]] = {
+    "underwear": ("下着", "下着姿", "ランジェリー", "lingerie", "underwear"),
+    "underwear_only": ("下着のみ", "下着だけ", "underwear only"),
+    "bra": ("ブラ", "ブラジャー", "bra"),
+    "panties": ("パンツ", "パンティ", "パンティー", "ショーツ", "panties"),
+    "dress": ("ドレス", "ワンピース", "dress"),
+    "shirt": ("シャツ", "shirt"),
+    "skirt": ("スカート", "skirt"),
+    "swimwear": ("水着", "ビキニ", "swimsuit", "bikini"),
+    "thighhighs": ("ニーハイ", "thighhighs"),
+    "pantyhose": ("パンスト", "ストッキング", "パンティストッキング", "pantyhose"),
+    "full_body": ("全身", "全身像", "full body"),
+    "upper_body": ("上半身", "バストアップ", "upper body"),
+    "sitting": ("座り", "座って", "sitting"),
+    "standing": ("立ち", "立って", "standing"),
+    "flat_chest": ("貧乳", "ぺたんこ", "平らな胸", "flat chest"),
+    "small_breasts": ("小さな胸", "small breasts"),
+    "medium_breasts": ("普通の胸", "medium breasts"),
+    "large_breasts": ("巨乳", "大きな胸", "large breasts", "big breasts"),
+    "huge_breasts": ("爆乳", "huge breasts"),
+    "gigantic_breasts": ("超爆乳", "gigantic breasts"),
+}
+UNDERWEAR_THEME_ALLOWED_FAMILIES: frozenset[str] = frozenset({"underwear", "bra", "panties"})
 STRICT_TAG_DENYLIST: frozenset[str] = frozenset(
     {
         "quality",
@@ -253,6 +285,11 @@ OUTPUT_BUCKET_ORDER: tuple[str, ...] = (
     "background",
 )
 SUBJECT_COUNT_PATTERN = re.compile(r"^(?P<count>\d+)(girl|girls|boy|boys|other|others)$")
+POSE_CONFLICT_GROUPS: tuple[frozenset[str], ...] = (
+    frozenset({"sitting", "standing", "kneeling", "lying", "crouching", "leaning", "wariza"}),
+    frozenset({"full_body", "upper_body", "cowboy_shot"}),
+    frozenset({"profile", "from_side", "from_behind"}),
+)
 SDXL_DANBOORU_SYSTEM_PROMPT = (
     "あなたは、Stable Diffusion XL（SDXL）向けのプロンプトを生成する専門エージェントです。"
     "Danbooruタグ形式をベースに、構造化されたタグ列のみを出力してください。"
@@ -296,8 +333,44 @@ def _split_color_tag(tag: str) -> tuple[str | None, str]:
     return (prefix, remainder)
 
 
+def _canonical_clothing_family(term: str) -> str:
+    return CANONICAL_CLOTHING_FAMILIES.get(term, term)
+
+
+def _extract_clothing_family(tag: str) -> str | None:
+    for term in SORTED_CLOTHING_TERMS:
+        if tag == term or tag.endswith(f"_{term}"):
+            return _canonical_clothing_family(term)
+    return None
+
+
 def _is_clothing_tag(tag: str) -> bool:
-    return any(tag == term or tag.endswith(f"_{term}") for term in CLOTHING_TERMS)
+    return _extract_clothing_family(tag) is not None
+
+
+def _instruction_mentions_aliases(instruction_ja: str, aliases: tuple[str, ...]) -> bool:
+    lowered = instruction_ja.casefold()
+    return any(alias.casefold() in lowered for alias in aliases)
+
+
+def _instruction_mentions_concept(instruction_ja: str, concept: str) -> bool:
+    aliases = INSTRUCTION_CONCEPT_ALIASES.get(concept)
+    if aliases is None:
+        return False
+    return _instruction_mentions_aliases(instruction_ja, aliases)
+
+
+def _instruction_requests_underwear_theme(instruction_ja: str) -> bool:
+    return any(
+        _instruction_mentions_concept(instruction_ja, concept)
+        for concept in ("underwear", "underwear_only", "bra", "panties")
+    )
+
+
+def _is_specific_breast_detail_tag(tag: str) -> bool:
+    if tag == "breasts" or tag in BREAST_SIZE_TAGS:
+        return False
+    return tag.endswith("_breasts")
 
 
 def _require_numpy() -> object:
@@ -365,6 +438,11 @@ def _instruction_explicitly_mentions_tag(instruction_ja: str, metadata: TagMetad
     if _instruction_mentions_text(instruction_ja, metadata.name):
         return True
     if _instruction_mentions_text(instruction_ja, _display_tag(metadata.name)):
+        return True
+    if _instruction_mentions_concept(instruction_ja, metadata.name):
+        return True
+    clothing_family = _extract_clothing_family(metadata.name)
+    if clothing_family is not None and _instruction_mentions_concept(instruction_ja, clothing_family):
         return True
     words_text = " ".join(metadata.words)
     return _instruction_mentions_text(instruction_ja, words_text)
@@ -449,6 +527,18 @@ def _classify_tag_bucket(tag: str, metadata: TagMetadata | None) -> str:
 def _should_allow_metadata_by_default(instruction_ja: str, metadata: TagMetadata) -> bool:
     if _is_denied_by_strict_policy(metadata.name):
         return False
+    if metadata.name in BREAST_SIZE_TAGS and not _instruction_explicitly_mentions_tag(instruction_ja, metadata):
+        return False
+    if _is_specific_breast_detail_tag(metadata.name) and not _instruction_explicitly_mentions_tag(instruction_ja, metadata):
+        return False
+    clothing_family = _extract_clothing_family(metadata.name)
+    if (
+        clothing_family is not None
+        and _instruction_requests_underwear_theme(instruction_ja)
+        and clothing_family not in UNDERWEAR_THEME_ALLOWED_FAMILIES
+        and not _instruction_explicitly_mentions_tag(instruction_ja, metadata)
+    ):
+        return False
     if metadata.category in EXPLICIT_ONLY_CATEGORIES and not _instruction_explicitly_mentions_tag(instruction_ja, metadata):
         return False
     return True
@@ -505,6 +595,47 @@ def _filter_background_conflicts(ordered_selected_tags: list[str]) -> list[str]:
             if seen_specific_background:
                 continue
             seen_specific_background = True
+        kept_tags.append(tag)
+    return kept_tags
+
+
+def _filter_pose_conflicts(ordered_selected_tags: list[str]) -> list[str]:
+    kept_tags: list[str] = []
+    seen_group_indexes: set[int] = set()
+    for tag in ordered_selected_tags:
+        matched_group_index: int | None = None
+        for group_index, group in enumerate(POSE_CONFLICT_GROUPS):
+            if tag in group:
+                matched_group_index = group_index
+                break
+        if matched_group_index is not None:
+            if matched_group_index in seen_group_indexes:
+                continue
+            seen_group_indexes.add(matched_group_index)
+        kept_tags.append(tag)
+    return kept_tags
+
+
+def _filter_underwear_theme_conflicts(ordered_selected_tags: list[str], instruction_ja: str) -> list[str]:
+    if not _instruction_requests_underwear_theme(instruction_ja):
+        return ordered_selected_tags
+
+    kept_tags: list[str] = []
+    seen_underwear_families: set[str] = set()
+    for tag in ordered_selected_tags:
+        clothing_family = _extract_clothing_family(tag)
+        if clothing_family is None:
+            kept_tags.append(tag)
+            continue
+        if (
+            clothing_family not in UNDERWEAR_THEME_ALLOWED_FAMILIES
+            and not _instruction_mentions_concept(instruction_ja, clothing_family)
+        ):
+            continue
+        if clothing_family in UNDERWEAR_THEME_ALLOWED_FAMILIES:
+            if clothing_family in seen_underwear_families:
+                continue
+            seen_underwear_families.add(clothing_family)
         kept_tags.append(tag)
     return kept_tags
 
@@ -723,6 +854,7 @@ class TagEmbeddingCatalog:
                 color_bonus = -0.18
             else:
                 color_bonus = -0.06
+        explicit_mention_bonus = 0.12 if _instruction_explicitly_mentions_tag(instruction_ja, metadata) else 0.0
         return (
             (similarity * category_weight)
             + post_count_boost
@@ -730,6 +862,7 @@ class TagEmbeddingCatalog:
             + deprecated_penalty
             + strict_policy_penalty
             + color_bonus
+            + explicit_mention_bonus
         )
 
     def _build_index(self) -> TagIndex:
@@ -1145,6 +1278,9 @@ class BonsaiCsvTagSelectorNode:
             "ルール:\n"
             "- 候補一覧にあるタグだけを使う\n"
             "- 指示に直接関係するタグだけを選ぶ\n"
+            "- 指示にない胸サイズや胸まわりの細部タグは補完しない\n"
+            "- 同じ部位に競合する衣装タグを同時に選ばない\n"
+            "- full_body と upper_body のような競合構図タグを同時に選ばない\n"
             "- 品質タグ、画風タグ、artist/meta タグは明示要求がない限り選ばない\n"
             "- 人数/主題 -> 版権/キャラ -> 身体属性 -> 顔/目線 -> 髪/頭部 -> 服/装飾 -> ポーズ/構図 -> 背景の順で考える\n"
             "- 出力は `Prompt: tag1, tag2, ...` の1行のみ\n"
@@ -1237,6 +1373,8 @@ class BonsaiCsvTagSelectorNode:
         )
         filtered_tags = _filter_background_conflicts(filtered_tags)
         filtered_tags = _filter_breast_size_conflicts(filtered_tags)
+        filtered_tags = _filter_pose_conflicts(filtered_tags)
+        filtered_tags = _filter_underwear_theme_conflicts(filtered_tags, instruction_ja=instruction_ja)
         filtered_tags = _filter_subject_conflicts(filtered_tags)
         ordered_output = _apply_output_bucket_order(
             ordered_selected_tags=filtered_tags,
