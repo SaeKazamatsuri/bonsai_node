@@ -1,12 +1,16 @@
 from __future__ import annotations
 
-import csv
-import re
+import json
+import math
 import threading
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .bonsai_manager import BonsaiServerManager
+
+if TYPE_CHECKING:
+    import numpy as np
 
 
 def _normalize_tags(text: str) -> str:
@@ -26,142 +30,394 @@ def _validate_instruction(instruction_ja: str) -> str:
     return stripped
 
 
+def _require_numpy() -> object:
+    try:
+        import numpy as np
+    except ImportError as exc:
+        raise RuntimeError(
+            "numpy が必要です。`pip install numpy sentence-transformers torch` を実行してください。"
+        ) from exc
+    return np
+
+
+def _require_sentence_transformer() -> object:
+    try:
+        from sentence_transformers import SentenceTransformer
+    except ImportError as exc:
+        raise RuntimeError(
+            "sentence-transformers が必要です。`pip install sentence-transformers torch numpy` を実行してください。"
+        ) from exc
+    return SentenceTransformer
+
+
 @dataclass(frozen=True)
-class TagEntry:
-    tag: str
-    count: int
+class TagMetadata:
+    name: str
+    words: list[str]
+    category: int
+    post_count: int
+    is_deprecated: bool
 
 
-class TagCatalog:
-    _instance: "TagCatalog | None" = None
-    _lock = threading.Lock()
+@dataclass(frozen=True)
+class TagSearchResult:
+    metadata: TagMetadata
+    similarity: float
+    score: float
 
-    def __init__(self, csv_path: Path) -> None:
-        self._csv_path = csv_path
-        self._entries = self._load_entries(csv_path)
-        self._tag_set = {entry.tag for entry in self._entries}
 
-    @classmethod
-    def instance(cls) -> "TagCatalog":
-        with cls._lock:
-            if cls._instance is None:
-                csv_path = Path(__file__).resolve().parent / "tags.csv"
-                cls._instance = cls(csv_path)
-            return cls._instance
+@dataclass(frozen=True)
+class TagIndex:
+    model_name: str
+    index_version: int
+    source_path: str
+    source_mtime_ns: int
+    source_size: int
+    metadata: list[TagMetadata]
+    vectors: "np.ndarray"
 
     @property
     def tag_set(self) -> set[str]:
-        return self._tag_set
+        return {item.name for item in self.metadata}
 
-    def find_candidates(self, instruction_ja: str, limit: int) -> list[TagEntry]:
-        if limit < 1:
-            raise ValueError("max_candidates は 1 以上にしてください。")
 
-        return self.find_candidates_for_queries([instruction_ja], limit)
+class TagEmbeddingCatalog:
+    _instance: "TagEmbeddingCatalog | None" = None
+    _lock = threading.Lock()
 
-    def find_candidates_for_queries(self, queries: list[str], limit: int) -> list[TagEntry]:
-        if limit < 1:
-            raise ValueError("max_candidates は 1 以上にしてください。")
+    INDEX_VERSION = 1
+    MODEL_NAME = "intfloat/multilingual-e5-small"
+    INDEX_META_NAME = "tag_index_meta.json"
+    INDEX_VECTOR_NAME = "tag_index_vectors.npz"
+    ENCODE_BATCH_SIZE = 256
+    SEARCH_MULTIPLIER = 6
+    MIN_INTERNAL_CANDIDATES = 256
 
-        prepared_queries = self._prepare_queries(queries)
-        scored_entries: list[tuple[int, int, str, TagEntry]] = []
+    CATEGORY_LABELS = {
+        0: "general",
+        1: "artist",
+        3: "copyright",
+        4: "character",
+        5: "meta",
+    }
+    CATEGORY_PROFILES: dict[str, dict[int, float]] = {
+        "balanced": {
+            0: 1.12,
+            1: 0.95,
+            3: 1.00,
+            4: 1.12,
+            5: 0.72,
+        },
+        "character_focus": {
+            0: 1.00,
+            1: 0.90,
+            3: 1.05,
+            4: 1.28,
+            5: 0.65,
+        },
+        "style_pose_focus": {
+            0: 1.20,
+            1: 0.92,
+            3: 0.88,
+            4: 0.92,
+            5: 0.60,
+        },
+    }
 
-        for entry in self._entries:
-            score = self._score_entry(entry, prepared_queries)
-            if score <= 0:
-                continue
-            scored_entries.append((score, entry.count, entry.tag, entry))
+    def __init__(self, base_dir: Path) -> None:
+        self._base_dir = base_dir
+        self._source_path = base_dir / "tags.json"
+        self._meta_path = base_dir / self.INDEX_META_NAME
+        self._vector_path = base_dir / self.INDEX_VECTOR_NAME
+        self._index: TagIndex | None = None
+        self._model: object | None = None
+        self._instance_lock = threading.RLock()
 
-        if not scored_entries:
-            raise ValueError("instruction_ja に一致する tags.csv の候補が見つかりません。")
+    @classmethod
+    def instance(cls) -> "TagEmbeddingCatalog":
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = cls(Path(__file__).resolve().parent)
+            return cls._instance
 
-        scored_entries.sort(key=lambda item: (-item[0], -item[1], item[2]))
-        return [item[3] for item in scored_entries[:limit]]
+    @classmethod
+    def category_profile_names(cls) -> tuple[str, ...]:
+        return tuple(cls.CATEGORY_PROFILES.keys())
 
     def filter_existing_tags(self, tags: list[str]) -> list[str]:
+        index = self.load_or_build_index(rebuild=False)
         filtered: list[str] = []
         seen: set[str] = set()
+        tag_set = index.tag_set
         for tag in tags:
-            if tag not in self._tag_set or tag in seen:
+            if tag not in tag_set or tag in seen:
                 continue
             filtered.append(tag)
             seen.add(tag)
         return filtered
 
-    @staticmethod
-    def _load_entries(csv_path: Path) -> list[TagEntry]:
-        if not csv_path.is_file():
-            raise FileNotFoundError(f"tags.csv が見つかりません: {csv_path}")
+    def search(self, instruction_ja: str, limit: int, category_profile: str, rebuild: bool) -> list[TagSearchResult]:
+        if limit < 1:
+            raise ValueError("max_candidates は 1 以上にしてください。")
+        if category_profile not in self.CATEGORY_PROFILES:
+            raise ValueError(f"未対応の category_profile です: {category_profile}")
 
-        entries: list[TagEntry] = []
-        with csv_path.open("r", encoding="utf-8", newline="") as file:
-            reader = csv.reader(file)
-            for row in reader:
-                if len(row) < 2:
-                    continue
-                tag = row[0].strip()
-                count_text = row[1].strip()
-                if not tag:
-                    continue
-                try:
-                    count = int(count_text)
-                except ValueError as exc:
-                    raise RuntimeError(f"tags.csv の頻度が整数ではありません: {tag}") from exc
-                entries.append(TagEntry(tag=tag, count=count))
-        if not entries:
-            raise RuntimeError("tags.csv からタグを読み込めませんでした。")
-        return entries
+        index = self.load_or_build_index(rebuild=rebuild)
+        query_vector = self._encode_query(instruction_ja)
+        candidates = self._collect_candidates(index=index, query_vector=query_vector, limit=limit)
+        if not candidates:
+            raise RuntimeError("instruction_ja に一致する tags.json の候補が見つかりません。")
 
-    @staticmethod
-    def _normalize_search_text(text: str) -> str:
-        lowered = text.strip().lower()
-        return re.sub(r"\s+", " ", lowered)
+        profile = self.CATEGORY_PROFILES[category_profile]
+        rescored: list[TagSearchResult] = []
+        for similarity, metadata in candidates:
+            score = self._score_candidate(metadata=metadata, similarity=similarity, profile=profile)
+            rescored.append(TagSearchResult(metadata=metadata, similarity=similarity, score=score))
 
-    @staticmethod
-    def _normalize_tag(tag: str) -> str:
-        lowered = tag.strip().lower()
-        replaced = lowered.replace("_", " ")
-        return re.sub(r"\s+", " ", replaced)
+        rescored.sort(
+            key=lambda item: (
+                -item.score,
+                -item.similarity,
+                -item.metadata.post_count,
+                item.metadata.name,
+            )
+        )
+        return rescored[:limit]
 
-    def _build_search_tokens(self, text: str) -> list[str]:
-        token_candidates = re.findall(r"[0-9a-zA-Z_]+|[ぁ-んァ-ヶー一-龠]{2,}", text)
-        normalized_tokens: list[str] = []
-        seen_tokens: set[str] = set()
-        for token in token_candidates:
-            normalized_token = self._normalize_tag(token)
-            if len(normalized_token) < 2 or normalized_token in seen_tokens:
+    def load_or_build_index(self, rebuild: bool) -> TagIndex:
+        with self._instance_lock:
+            if rebuild:
+                self._index = self._build_index()
+                return self._index
+
+            if self._index is not None and self._is_index_fresh(self._index):
+                return self._index
+
+            disk_index = self._load_index_from_disk()
+            if disk_index is not None and self._is_index_fresh(disk_index):
+                self._index = disk_index
+                return disk_index
+
+            self._index = self._build_index()
+            return self._index
+
+    def _load_model(self) -> object:
+        if self._model is not None:
+            return self._model
+
+        sentence_transformer = _require_sentence_transformer()
+        self._model = sentence_transformer(self.MODEL_NAME)
+        return self._model
+
+    def _encode_query(self, instruction_ja: str) -> "np.ndarray":
+        np_module = _require_numpy()
+        model = self._load_model()
+        encoded = model.encode(
+            [f"query: {instruction_ja.strip()}"],
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+            show_progress_bar=False,
+        )
+        return np_module.asarray(encoded[0], dtype=np_module.float32)
+
+    def _collect_candidates(
+        self,
+        index: TagIndex,
+        query_vector: "np.ndarray",
+        limit: int,
+    ) -> list[tuple[float, TagMetadata]]:
+        np_module = _require_numpy()
+        similarities = index.vectors @ query_vector
+        internal_limit = min(
+            len(index.metadata),
+            max(limit * self.SEARCH_MULTIPLIER, self.MIN_INTERNAL_CANDIDATES),
+        )
+        top_indices = np_module.argpartition(similarities, -internal_limit)[-internal_limit:]
+        sorted_indices = top_indices[np_module.argsort(similarities[top_indices])[::-1]]
+
+        results: list[tuple[float, TagMetadata]] = []
+        for raw_index in sorted_indices.tolist():
+            similarity = float(similarities[raw_index])
+            metadata = index.metadata[int(raw_index)]
+            results.append((similarity, metadata))
+        return results
+
+    def _score_candidate(self, metadata: TagMetadata, similarity: float, profile: dict[int, float]) -> float:
+        category_weight = profile.get(metadata.category, 0.82)
+        deprecated_penalty = -0.25 if metadata.is_deprecated else 0.0
+        post_count_boost = min(0.18, math.log10(max(metadata.post_count, 1) + 1.0) * 0.03)
+        exact_word_bonus = 0.03 if metadata.name in metadata.words else 0.0
+        return (similarity * category_weight) + post_count_boost + exact_word_bonus + deprecated_penalty
+
+    def _build_index(self) -> TagIndex:
+        source_signature = self._source_signature()
+        metadata = self._load_metadata_from_source()
+        vectors = self._encode_passages(metadata)
+        index = TagIndex(
+            model_name=self.MODEL_NAME,
+            index_version=self.INDEX_VERSION,
+            source_path=str(self._source_path),
+            source_mtime_ns=source_signature["source_mtime_ns"],
+            source_size=source_signature["source_size"],
+            metadata=metadata,
+            vectors=vectors,
+        )
+        self._save_index(index)
+        return index
+
+    def _encode_passages(self, metadata: list[TagMetadata]) -> "np.ndarray":
+        np_module = _require_numpy()
+        model = self._load_model()
+        passages = [self._build_passage_text(item) for item in metadata]
+        vectors = model.encode(
+            passages,
+            batch_size=self.ENCODE_BATCH_SIZE,
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+            show_progress_bar=False,
+        )
+        return np_module.asarray(vectors, dtype=np_module.float32)
+
+    def _save_index(self, index: TagIndex) -> None:
+        np_module = _require_numpy()
+        meta_payload = {
+            "model_name": index.model_name,
+            "index_version": index.index_version,
+            "source_path": index.source_path,
+            "source_mtime_ns": index.source_mtime_ns,
+            "source_size": index.source_size,
+            "metadata": [asdict(item) for item in index.metadata],
+        }
+        with self._meta_path.open("w", encoding="utf-8") as file:
+            json.dump(meta_payload, file, ensure_ascii=False)
+        np_module.savez_compressed(self._vector_path, vectors=index.vectors)
+
+    def _load_index_from_disk(self) -> TagIndex | None:
+        if not self._meta_path.is_file() or not self._vector_path.is_file():
+            return None
+
+        np_module = _require_numpy()
+        with self._meta_path.open("r", encoding="utf-8") as file:
+            raw_meta = json.load(file)
+
+        if not isinstance(raw_meta, dict):
+            return None
+
+        metadata_raw = raw_meta.get("metadata")
+        if not isinstance(metadata_raw, list):
+            return None
+
+        metadata: list[TagMetadata] = []
+        for item in metadata_raw:
+            if not isinstance(item, dict):
+                return None
+            name = item.get("name")
+            words = item.get("words")
+            category = item.get("category")
+            post_count = item.get("post_count")
+            is_deprecated = item.get("is_deprecated")
+            if (
+                not isinstance(name, str)
+                or not isinstance(words, list)
+                or not all(isinstance(word, str) for word in words)
+                or not isinstance(category, int)
+                or not isinstance(post_count, int)
+                or not isinstance(is_deprecated, bool)
+            ):
+                return None
+            metadata.append(
+                TagMetadata(
+                    name=name,
+                    words=list(words),
+                    category=category,
+                    post_count=post_count,
+                    is_deprecated=is_deprecated,
+                )
+            )
+
+        with np_module.load(self._vector_path) as loaded:
+            vectors = np_module.asarray(loaded["vectors"], dtype=np_module.float32)
+
+        if len(metadata) != int(vectors.shape[0]):
+            return None
+
+        return TagIndex(
+            model_name=str(raw_meta.get("model_name", "")),
+            index_version=int(raw_meta.get("index_version", 0)),
+            source_path=str(raw_meta.get("source_path", "")),
+            source_mtime_ns=int(raw_meta.get("source_mtime_ns", 0)),
+            source_size=int(raw_meta.get("source_size", 0)),
+            metadata=metadata,
+            vectors=vectors,
+        )
+
+    def _is_index_fresh(self, index: TagIndex) -> bool:
+        source_signature = self._source_signature()
+        return (
+            index.index_version == self.INDEX_VERSION
+            and index.model_name == self.MODEL_NAME
+            and index.source_path == str(self._source_path)
+            and index.source_mtime_ns == source_signature["source_mtime_ns"]
+            and index.source_size == source_signature["source_size"]
+            and len(index.metadata) > 0
+        )
+
+    def _source_signature(self) -> dict[str, int]:
+        if not self._source_path.is_file():
+            raise FileNotFoundError(f"tags.json が見つかりません: {self._source_path}")
+        stat = self._source_path.stat()
+        return {
+            "source_mtime_ns": stat.st_mtime_ns,
+            "source_size": stat.st_size,
+        }
+
+    def _load_metadata_from_source(self) -> list[TagMetadata]:
+        with self._source_path.open("r", encoding="utf-8") as file:
+            raw = json.load(file)
+
+        if not isinstance(raw, list):
+            raise RuntimeError("tags.json の内容が不正です。")
+
+        metadata: list[TagMetadata] = []
+        for item in raw:
+            if not isinstance(item, dict):
                 continue
-            normalized_tokens.append(normalized_token)
-            seen_tokens.add(normalized_token)
-        return normalized_tokens
-
-    def _prepare_queries(self, queries: list[str]) -> list[tuple[str, list[str]]]:
-        prepared: list[tuple[str, list[str]]] = []
-        seen_queries: set[str] = set()
-        for query in queries:
-            normalized_query = self._normalize_search_text(query)
-            if not normalized_query or normalized_query in seen_queries:
+            name = item.get("name")
+            words = item.get("words")
+            category = item.get("category")
+            post_count = item.get("post_count")
+            is_deprecated = item.get("is_deprecated")
+            if (
+                not isinstance(name, str)
+                or not isinstance(words, list)
+                or not all(isinstance(word, str) for word in words)
+                or not isinstance(category, int)
+                or not isinstance(post_count, int)
+                or not isinstance(is_deprecated, bool)
+            ):
                 continue
-            prepared.append((normalized_query, self._build_search_tokens(normalized_query)))
-            seen_queries.add(normalized_query)
-        return prepared
+            metadata.append(
+                TagMetadata(
+                    name=name,
+                    words=list(words),
+                    category=category,
+                    post_count=post_count,
+                    is_deprecated=is_deprecated,
+                )
+            )
 
-    def _score_entry(self, entry: TagEntry, queries: list[tuple[str, list[str]]]) -> int:
-        normalized_tag = self._normalize_tag(entry.tag)
-        if not normalized_tag:
-            return 0
+        if not metadata:
+            raise RuntimeError("tags.json からタグを読み込めませんでした。")
+        return metadata
 
-        score = 0
-        for normalized_query, tokens in queries:
-            if normalized_query and normalized_query in normalized_tag:
-                score += 100 + len(normalized_query)
-            for token in tokens:
-                if token == normalized_tag:
-                    score += 80 + len(token)
-                    continue
-                if token in normalized_tag:
-                    score += 20 + len(token)
-        return score
+    def _build_passage_text(self, metadata: TagMetadata) -> str:
+        category_label = self.CATEGORY_LABELS.get(metadata.category, "other")
+        words_text = " ".join(metadata.words)
+        return (
+            f"passage: tag {metadata.name} "
+            f"words {words_text} "
+            f"category {category_label}"
+        ).strip()
 
 
 class BonsaiChatNode:
@@ -238,31 +494,25 @@ class BonsaiCsvTagSelectorNode:
     DEFAULT_MAX_TOKENS = 128
     DEFAULT_TOP_P = 0.9
     DEFAULT_TOP_K = 20
-    DEFAULT_CREATIVITY = 0.3
     DEFAULT_SYSTEM_PROMPT = (
-        "あなたは tags.csv 候補から画像生成タグを選ぶアシスタントです。"
+        "あなたは tags.json の候補から画像生成タグを選ぶアシスタントです。"
         "必ず候補一覧に含まれるタグだけを選んでください。"
         "候補にないタグを新規生成してはいけません。"
         "出力は1行のカンマ区切りタグのみとし、説明文、番号、改行、前置きは禁止です。"
     )
-    SEARCH_SYSTEM_PROMPT = (
-        "あなたは日本語の画像指示を、tags.csv 検索用の短い英語タグ候補へ変換するアシスタントです。"
-        "出力は1行のカンマ区切りタグのみとし、説明文、番号、改行、前置きは禁止です。"
-        "人物、構図、背景、色、雰囲気、作品ジャンルを含めてよいです。"
-        "抽象的な指示でも、画像タグ検索に有効な具体語へ言い換えてください。"
-    )
 
     @classmethod
-    def INPUT_TYPES(cls) -> dict[str, dict[str, tuple[str, dict[str, object]]]]:
+    def INPUT_TYPES(cls) -> dict[str, dict[str, tuple[object, dict[str, object]]]]:
         return {
             "required": {
                 "instruction_ja": ("STRING", {"multiline": True, "default": ""}),
                 "max_candidates": ("INT", {"default": 200, "min": 1, "max": 2000}),
                 "max_selected_tags": ("INT", {"default": 32, "min": 1, "max": 256}),
-                "creativity": (
-                    "FLOAT",
-                    {"default": cls.DEFAULT_CREATIVITY, "min": 0.0, "max": 1.0, "step": 0.05},
+                "category_profile": (
+                    TagEmbeddingCatalog.category_profile_names(),
+                    {"default": "balanced"},
                 ),
+                "rebuild_index": ("BOOLEAN", {"default": False}),
             }
         }
 
@@ -271,35 +521,34 @@ class BonsaiCsvTagSelectorNode:
         instruction_ja: str,
         max_candidates: int,
         max_selected_tags: int,
-        creativity: float,
+        category_profile: str,
+        rebuild_index: bool,
     ) -> tuple[str]:
         stripped_instruction = _validate_instruction(instruction_ja)
         if max_selected_tags < 1:
             raise ValueError("max_selected_tags は 1 以上にしてください。")
 
-        manager = BonsaiServerManager.instance()
-        creativity_value = self._clamp_creativity(creativity)
-        search_queries = self._build_search_queries(
-            manager=manager,
+        catalog = TagEmbeddingCatalog.instance()
+        candidates = catalog.search(
             instruction_ja=stripped_instruction,
-            creativity=creativity_value,
+            limit=max_candidates,
+            category_profile=category_profile,
+            rebuild=bool(rebuild_index),
         )
+        candidate_tags = [item.metadata.name for item in candidates]
 
-        catalog = TagCatalog.instance()
-        candidates = catalog.find_candidates_for_queries(search_queries, max_candidates)
-        candidate_tags = [entry.tag for entry in candidates]
-
+        manager = BonsaiServerManager.instance()
         text = manager.chat(
             system_prompt=self.DEFAULT_SYSTEM_PROMPT,
             user_prompt=self._build_user_prompt(
                 instruction_ja=stripped_instruction,
-                candidate_tags=candidate_tags,
+                candidates=candidates,
                 max_selected_tags=max_selected_tags,
-                creativity=creativity_value,
+                category_profile=category_profile,
             ),
-            temperature=self._selection_temperature(creativity_value),
+            temperature=self.DEFAULT_TEMPERATURE,
             max_tokens=self.DEFAULT_MAX_TOKENS,
-            top_p=self._selection_top_p(creativity_value),
+            top_p=self.DEFAULT_TOP_P,
             top_k=self.DEFAULT_TOP_K,
         )
 
@@ -316,28 +565,24 @@ class BonsaiCsvTagSelectorNode:
     @staticmethod
     def _build_user_prompt(
         instruction_ja: str,
-        candidate_tags: list[str],
+        candidates: list[TagSearchResult],
         max_selected_tags: int,
-        creativity: float,
+        category_profile: str,
     ) -> str:
-        candidate_lines = "\n".join(f"- {tag}" for tag in candidate_tags)
-        creativity_instruction = (
-            "指示にかなり忠実に選んでください。連想は最小限にしてください。"
-            if creativity < 0.34
-            else "指示に沿いつつ、画像として自然な補完を少しだけ行ってください。"
-            if creativity < 0.67
-            else "指示の意図を広めに解釈し、雰囲気や構図の補完も積極的に行ってください。"
+        candidate_lines = "\n".join(
+            f"- {item.metadata.name} | category={TagEmbeddingCatalog.CATEGORY_LABELS.get(item.metadata.category, 'other')} | post_count={item.metadata.post_count}"
+            for item in candidates
         )
         return (
             "次の日本語指示に合うタグを候補一覧から選んでください。\n"
             f"指示: {instruction_ja}\n"
-            f"独創性: {creativity:.2f}\n"
+            f"category_profile: {category_profile}\n"
             f"最大選択数: {max_selected_tags}\n"
             "ルール:\n"
             "- 候補一覧にあるタグだけを使う\n"
-            "- 必要なタグだけを選ぶ\n"
+            "- 指示に本当に必要なタグだけを選ぶ\n"
             "- 出力は1行のカンマ区切りタグのみ\n"
-            f"- {creativity_instruction}\n"
+            "- category や post_count は参考情報であり、出力には含めない\n"
             "候補一覧:\n"
             f"{candidate_lines}"
         )
@@ -347,7 +592,7 @@ class BonsaiCsvTagSelectorNode:
         text: str,
         candidate_tags: list[str],
         max_selected_tags: int,
-        catalog: TagCatalog,
+        catalog: TagEmbeddingCatalog,
     ) -> list[str]:
         normalized_text = _normalize_tags(text)
         raw_tags = [part.strip() for part in normalized_text.split(",") if part.strip()]
@@ -356,61 +601,3 @@ class BonsaiCsvTagSelectorNode:
         selected_tag_set = {tag for tag in valid_catalog_tags if tag in candidate_tag_set}
         ordered_selected_tags = [tag for tag in candidate_tags if tag in selected_tag_set]
         return ordered_selected_tags[:max_selected_tags]
-
-    def _build_search_queries(
-        self,
-        manager: BonsaiServerManager,
-        instruction_ja: str,
-        creativity: float,
-    ) -> list[str]:
-        search_hint_text = manager.chat(
-            system_prompt=self.SEARCH_SYSTEM_PROMPT,
-            user_prompt=self._build_search_prompt(instruction_ja, creativity),
-            temperature=self._search_temperature(creativity),
-            max_tokens=self.DEFAULT_MAX_TOKENS,
-            top_p=self._search_top_p(creativity),
-            top_k=self.DEFAULT_TOP_K,
-        )
-        search_hints = _split_tags(search_hint_text)
-        return [instruction_ja, *search_hints]
-
-    @staticmethod
-    def _build_search_prompt(instruction_ja: str, creativity: float) -> str:
-        creativity_instruction = (
-            "元の指示に近い直接的な検索語を優先してください。"
-            if creativity < 0.34
-            else "元の指示に加えて、近い言い換えや補助的な検索語も出してください。"
-            if creativity < 0.67
-            else "抽象語を具体的な視覚要素へ展開し、雰囲気や演出の検索語も出してください。"
-        )
-        return (
-            "次の日本語指示から、tags.csv を探すための短い英語タグ候補を作成してください。\n"
-            f"指示: {instruction_ja}\n"
-            f"独創性: {creativity:.2f}\n"
-            "ルール:\n"
-            "- 1行のカンマ区切りのみ\n"
-            "- 英語中心の短いタグ候補\n"
-            "- 同義語や言い換えを含めてよい\n"
-            "- 画像タグ検索に不向きな長文は禁止\n"
-            f"- {creativity_instruction}"
-        )
-
-    @staticmethod
-    def _clamp_creativity(creativity: float) -> float:
-        return max(0.0, min(1.0, creativity))
-
-    @classmethod
-    def _search_temperature(cls, creativity: float) -> float:
-        return 0.15 + (0.55 * creativity)
-
-    @classmethod
-    def _search_top_p(cls, creativity: float) -> float:
-        return min(0.98, 0.75 + (0.2 * creativity))
-
-    @classmethod
-    def _selection_temperature(cls, creativity: float) -> float:
-        return cls.DEFAULT_TEMPERATURE + (0.35 * creativity)
-
-    @classmethod
-    def _selection_top_p(cls, creativity: float) -> float:
-        return min(0.98, cls.DEFAULT_TOP_P + (0.08 * creativity))

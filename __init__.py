@@ -10,5 +10,5 @@ NODE_CLASS_MAPPINGS = {
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "BonsaiChatNode": "Bonsai Tag Generator",
-    "BonsaiCsvTagSelectorNode": "Bonsai CSV Tag Selector",
+    "BonsaiCsvTagSelectorNode": "Bonsai Semantic Tag Selector",
 }
