@@ -23,11 +23,92 @@ def _split_tags(text: str) -> list[str]:
     return [part.strip() for part in normalized.split(",") if part.strip()]
 
 
+def _display_tag(tag: str) -> str:
+    return tag.replace("_", " ")
+
+
+COLOR_ALIASES: dict[str, tuple[str, ...]] = {
+    "black": ("黒", "黒い", "ブラック", "black"),
+    "blue": ("青", "青い", "ブルー", "blue"),
+    "white": ("白", "白い", "ホワイト", "white"),
+    "red": ("赤", "赤い", "レッド", "red"),
+    "green": ("緑", "緑色", "グリーン", "green"),
+    "yellow": ("黄", "黄色", "イエロー", "yellow"),
+    "pink": ("ピンク", "pink"),
+    "purple": ("紫", "紫色", "パープル", "purple"),
+    "grey": ("灰", "灰色", "グレー", "grey", "gray"),
+    "brown": ("茶", "茶色", "ブラウン", "brown"),
+}
+KNOWN_COLOR_PREFIXES: set[str] = set(COLOR_ALIASES.keys())
+CLOTHING_TERMS: tuple[str, ...] = (
+    "dress",
+    "shirt",
+    "skirt",
+    "jacket",
+    "coat",
+    "hoodie",
+    "sweater",
+    "vest",
+    "kimono",
+    "serafuku",
+    "suit",
+    "bra",
+    "sports_bra",
+    "panties",
+    "shoes",
+    "sleeves",
+    "collar",
+    "ribbon",
+    "bow",
+    "necktie",
+    "neckerchief",
+    "socks",
+    "thighhighs",
+    "pantyhose",
+    "gloves",
+    "cardigan",
+    "cloak",
+    "cape",
+    "boots",
+    "sandals",
+    "pants",
+    "shorts",
+    "buruma",
+    "leotard",
+    "bodysuit",
+    "bikini",
+    "one-piece_swimsuit",
+)
+
+
 def _validate_instruction(instruction_ja: str) -> str:
     stripped = instruction_ja.strip()
     if not stripped:
         raise ValueError("instruction_ja を入力してください。")
     return stripped
+
+
+def _extract_requested_colors(instruction_ja: str) -> set[str]:
+    lowered = instruction_ja.casefold()
+    requested: set[str] = set()
+    for color, aliases in COLOR_ALIASES.items():
+        if any(alias.casefold() in lowered for alias in aliases):
+            requested.add(color)
+    return requested
+
+
+def _split_color_tag(tag: str) -> tuple[str | None, str]:
+    parts = tag.split("_", 1)
+    if len(parts) != 2:
+        return (None, tag)
+    prefix, remainder = parts
+    if prefix not in KNOWN_COLOR_PREFIXES:
+        return (None, tag)
+    return (prefix, remainder)
+
+
+def _is_clothing_tag(tag: str) -> bool:
+    return any(tag == term or tag.endswith(f"_{term}") for term in CLOTHING_TERMS)
 
 
 def _require_numpy() -> object:
@@ -163,6 +244,7 @@ class TagEmbeddingCatalog:
             raise ValueError(f"未対応の category_profile です: {category_profile}")
 
         index = self.load_or_build_index(rebuild=rebuild)
+        requested_colors = _extract_requested_colors(instruction_ja)
         query_vector = self._encode_query(instruction_ja)
         candidates = self._collect_candidates(index=index, query_vector=query_vector, limit=limit)
         if not candidates:
@@ -171,7 +253,12 @@ class TagEmbeddingCatalog:
         profile = self.CATEGORY_PROFILES[category_profile]
         rescored: list[TagSearchResult] = []
         for similarity, metadata in candidates:
-            score = self._score_candidate(metadata=metadata, similarity=similarity, profile=profile)
+            score = self._score_candidate(
+                metadata=metadata,
+                similarity=similarity,
+                profile=profile,
+                requested_colors=requested_colors,
+            )
             rescored.append(TagSearchResult(metadata=metadata, similarity=similarity, score=score))
 
         rescored.sort(
@@ -242,12 +329,27 @@ class TagEmbeddingCatalog:
             results.append((similarity, metadata))
         return results
 
-    def _score_candidate(self, metadata: TagMetadata, similarity: float, profile: dict[int, float]) -> float:
+    def _score_candidate(
+        self,
+        metadata: TagMetadata,
+        similarity: float,
+        profile: dict[int, float],
+        requested_colors: set[str],
+    ) -> float:
         category_weight = profile.get(metadata.category, 0.82)
         deprecated_penalty = -0.25 if metadata.is_deprecated else 0.0
         post_count_boost = min(0.18, math.log10(max(metadata.post_count, 1) + 1.0) * 0.03)
         exact_word_bonus = 0.03 if metadata.name in metadata.words else 0.0
-        return (similarity * category_weight) + post_count_boost + exact_word_bonus + deprecated_penalty
+        color_bonus = 0.0
+        color_prefix, _ = _split_color_tag(metadata.name)
+        if requested_colors and color_prefix is not None:
+            if color_prefix in requested_colors:
+                color_bonus = 0.14
+            elif _is_clothing_tag(metadata.name):
+                color_bonus = -0.18
+            else:
+                color_bonus = -0.06
+        return (similarity * category_weight) + post_count_boost + exact_word_bonus + deprecated_penalty + color_bonus
 
     def _build_index(self) -> TagIndex:
         source_signature = self._source_signature()
@@ -550,18 +652,20 @@ class BonsaiCsvTagSelectorNode:
 
         normalized_tags = self._normalize_selected_tags(
             text=text,
+            instruction_ja=stripped_instruction,
             candidate_tags=candidate_tags,
             max_selected_tags=max_selected_tags,
             catalog=catalog,
         )
         if not normalized_tags:
             raise RuntimeError("候補内のタグを選択できませんでした。")
-        return (",".join(normalized_tags),)
+        display_tags = [_display_tag(tag) for tag in normalized_tags]
+        return (",".join(display_tags),)
 
     @staticmethod
     def _build_candidate_line(item: TagSearchResult) -> str:
         return (
-            f"- {item.metadata.name} | "
+            f"- {_display_tag(item.metadata.name)} | "
             f"category={TagEmbeddingCatalog.CATEGORY_LABELS.get(item.metadata.category, 'other')} | "
             f"post_count={item.metadata.post_count}"
         )
@@ -694,14 +798,43 @@ class BonsaiCsvTagSelectorNode:
     @staticmethod
     def _normalize_selected_tags(
         text: str,
+        instruction_ja: str,
         candidate_tags: list[str],
         max_selected_tags: int,
         catalog: TagEmbeddingCatalog,
     ) -> list[str]:
         normalized_text = _normalize_tags(text)
         raw_tags = [part.strip() for part in normalized_text.split(",") if part.strip()]
-        valid_catalog_tags = catalog.filter_existing_tags(raw_tags)
+        display_to_tag = {_display_tag(tag): tag for tag in candidate_tags}
+        resolved_tags = [display_to_tag.get(tag, tag) for tag in raw_tags]
+        valid_catalog_tags = catalog.filter_existing_tags(resolved_tags)
         candidate_tag_set = set(candidate_tags)
         selected_tag_set = {tag for tag in valid_catalog_tags if tag in candidate_tag_set}
         ordered_selected_tags = [tag for tag in candidate_tags if tag in selected_tag_set]
-        return ordered_selected_tags[:max_selected_tags]
+        resolved_tags = BonsaiCsvTagSelectorNode._filter_conflicting_color_tags(
+            ordered_selected_tags=ordered_selected_tags,
+            instruction_ja=instruction_ja,
+        )
+        return resolved_tags[:max_selected_tags]
+
+    @staticmethod
+    def _filter_conflicting_color_tags(ordered_selected_tags: list[str], instruction_ja: str) -> list[str]:
+        requested_colors = _extract_requested_colors(instruction_ja)
+        if not requested_colors:
+            return ordered_selected_tags
+
+        kept_tags: list[str] = []
+        requested_color_bases: set[str] = set()
+        for tag in ordered_selected_tags:
+            color_prefix, base_tag = _split_color_tag(tag)
+            if color_prefix is None:
+                kept_tags.append(tag)
+                continue
+            if color_prefix in requested_colors:
+                kept_tags.append(tag)
+                requested_color_bases.add(base_tag)
+                continue
+            if _is_clothing_tag(tag) and base_tag in requested_color_bases:
+                continue
+            kept_tags.append(tag)
+        return kept_tags

@@ -84,9 +84,9 @@ ComfyUI 上では `Bonsai Semantic Tag Selector` として表示されます。
 - 初回実行時に `intfloat/multilingual-e5-small` でタグ埋め込み索引を生成し、`tag_index_meta.json` と `tag_index_vectors.npz` を保存します
 - 2 回目以降は保存済み索引を再利用し、`tags.json` 更新時または `rebuild_index=true` のときだけ再生成します
 - 日本語指示を埋め込みベクトル化し、類似度で上位候補を取得します
-- その後 `category_profile`, `post_count`, `is_deprecated` を使って再ランクします
+- その後 `category_profile`, `post_count`, `is_deprecated` に加え、指示文中の色指定を使って再ランクします
 - Bonsai は候補一覧からのみタグを選択します
-- 最終出力では `tags.json` に存在しないタグ、候補外タグ、重複タグを除外します
+- 最終出力では `tags.json` に存在しないタグ、候補外タグ、重複タグを除外し、色指定と矛盾する衣装色タグを整理します
 
 既存ノードとの違い:
 
