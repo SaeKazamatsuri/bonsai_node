@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import threading
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -79,6 +80,178 @@ CLOTHING_TERMS: tuple[str, ...] = (
     "bikini",
     "one-piece_swimsuit",
 )
+STRICT_TAG_DENYLIST: frozenset[str] = frozenset(
+    {
+        "quality",
+        "masterpiece",
+        "best_quality",
+        "high_quality",
+        "highres",
+        "absurdres",
+        "worst_quality",
+        "lowres",
+        "aesthetic",
+        "official_style",
+        "source_anime",
+        "source_cartoon",
+        "source_furry",
+        "source_pony",
+        "source_comic",
+    }
+)
+STRICT_NOISE_EXACT_TAGS: frozenset[str] = frozenset(
+    {
+        "tag",
+        "content_rating",
+        "button_prompt",
+        "name_tag",
+        "price_tag",
+        "pixiv_id",
+        "pixiv_username",
+        "instagram_logo",
+        "instagram_username",
+        "timestamp",
+        "watermark",
+        "signature",
+    }
+)
+STRICT_NOISE_SUBSTRINGS: tuple[str, ...] = (
+    "_username",
+    "_id",
+    "watermark",
+    "signature",
+    "logo",
+    "prompt",
+    "content_rating",
+)
+EXPLICIT_ONLY_CATEGORIES: frozenset[int] = frozenset({1, 5})
+BREAST_SIZE_TAGS: frozenset[str] = frozenset(
+    {
+        "flat_chest",
+        "small_breasts",
+        "medium_breasts",
+        "large_breasts",
+        "huge_breasts",
+        "gigantic_breasts",
+    }
+)
+FACE_EXACT_TAGS: frozenset[str] = frozenset(
+    {
+        "blush",
+        "smile",
+        "open_mouth",
+        "closed_mouth",
+        "parted_lips",
+        "looking_at_viewer",
+        "teeth",
+        "tongue",
+        "nose_blush",
+    }
+)
+HAIR_HEAD_EXACT_TAGS: frozenset[str] = frozenset(
+    {
+        "bangs",
+        "ahoge",
+        "sidelocks",
+        "twintails",
+        "ponytail",
+        "braid",
+        "hair_ornament",
+        "hair_ribbon",
+        "hair_bow",
+        "headband",
+        "hat",
+    }
+)
+ACCESSORY_EXACT_TAGS: frozenset[str] = frozenset(
+    {
+        "jewelry",
+        "bracelet",
+        "earrings",
+        "necklace",
+        "choker",
+        "ring",
+        "anklet",
+    }
+)
+BODY_EXACT_TAGS: frozenset[str] = frozenset(
+    {
+        "breasts",
+        "navel",
+        "cleavage",
+        "collarbone",
+        "thighs",
+        "stomach",
+        "barefoot",
+        "legs",
+        "arms",
+        "shoulders",
+    }
+)
+POSE_EXACT_TAGS: frozenset[str] = frozenset(
+    {
+        "sitting",
+        "standing",
+        "kneeling",
+        "wariza",
+        "lying",
+        "crouching",
+        "leaning",
+        "full_body",
+        "upper_body",
+        "cowboy_shot",
+        "profile",
+        "from_side",
+        "from_behind",
+        "clothes_lift",
+        "shirt_lift",
+        "lifted_by_self",
+    }
+)
+BACKGROUND_EXACT_TAGS: frozenset[str] = frozenset(
+    {
+        "simple_background",
+        "white_background",
+        "black_background",
+        "transparent_background",
+        "outdoors",
+        "indoors",
+    }
+)
+PROMPT_BUCKET_ORDER: tuple[str, ...] = (
+    "subject",
+    "identity",
+    "body",
+    "face",
+    "hair_head",
+    "clothes",
+    "pose",
+    "background",
+    "other",
+)
+PROMPT_BUCKET_LABELS: dict[str, str] = {
+    "subject": "主題・人数",
+    "identity": "版権・キャラ",
+    "body": "身体・全体属性",
+    "face": "顔・表情・目線",
+    "hair_head": "髪・頭部",
+    "clothes": "服・装飾",
+    "pose": "ポーズ・構図・動作",
+    "background": "背景・環境",
+    "other": "その他",
+}
+OUTPUT_BUCKET_ORDER: tuple[str, ...] = (
+    "subject",
+    "identity",
+    "body",
+    "face",
+    "hair_head",
+    "clothes",
+    "pose",
+    "other",
+    "background",
+)
+SUBJECT_COUNT_PATTERN = re.compile(r"^(?P<count>\d+)(girl|girls|boy|boys|other|others)$")
 
 
 def _validate_instruction(instruction_ja: str) -> str:
@@ -160,6 +333,184 @@ class TagIndex:
     @property
     def tag_set(self) -> set[str]:
         return {item.name for item in self.metadata}
+
+
+def _normalized_tag_key(tag: str) -> str:
+    return "_".join(part for part in tag.strip().replace("\r", " ").replace("\n", " ").split() if part).casefold()
+
+
+def _instruction_mentions_text(instruction_ja: str, text: str) -> bool:
+    if not text:
+        return False
+    return text.casefold() in instruction_ja.casefold()
+
+
+def _instruction_explicitly_mentions_tag(instruction_ja: str, metadata: TagMetadata) -> bool:
+    if _instruction_mentions_text(instruction_ja, metadata.name):
+        return True
+    if _instruction_mentions_text(instruction_ja, _display_tag(metadata.name)):
+        return True
+    words_text = " ".join(metadata.words)
+    return _instruction_mentions_text(instruction_ja, words_text)
+
+
+def _is_denied_by_strict_policy(tag: str) -> bool:
+    return tag in STRICT_TAG_DENYLIST
+
+
+def _is_low_signal_tag(tag: str) -> bool:
+    if tag in STRICT_NOISE_EXACT_TAGS:
+        return True
+    return any(pattern in tag for pattern in STRICT_NOISE_SUBSTRINGS)
+
+
+def _is_subject_tag(tag: str) -> bool:
+    return (
+        tag == "solo"
+        or tag.endswith("_focus")
+        or tag.startswith("multiple_")
+        or SUBJECT_COUNT_PATTERN.match(tag) is not None
+        or (_person_count_value(tag) is not None)
+    )
+
+
+def _is_face_tag(tag: str) -> bool:
+    if tag in FACE_EXACT_TAGS:
+        return True
+    return tag.endswith(("_eyes", "_mouth", "_lips", "_eyebrows"))
+
+
+def _is_hair_head_tag(tag: str) -> bool:
+    if tag in HAIR_HEAD_EXACT_TAGS:
+        return True
+    return tag.endswith(("_hair", "_bangs", "_braid", "_ponytail", "_twintails"))
+
+
+def _is_accessory_tag(tag: str) -> bool:
+    if tag in ACCESSORY_EXACT_TAGS:
+        return True
+    return tag.endswith(("_earrings", "_necklace", "_bracelet", "_choker", "_ring"))
+
+
+def _is_body_tag(tag: str) -> bool:
+    if tag in BODY_EXACT_TAGS or tag in BREAST_SIZE_TAGS:
+        return True
+    return tag.endswith(("_breasts", "_body"))
+
+
+def _is_pose_tag(tag: str) -> bool:
+    if tag in POSE_EXACT_TAGS:
+        return True
+    return tag.endswith(("_shot", "_view", "_angle", "_pose", "_lift"))
+
+
+def _is_background_tag(tag: str) -> bool:
+    if tag in BACKGROUND_EXACT_TAGS:
+        return True
+    return tag.endswith("_background")
+
+
+def _classify_tag_bucket(tag: str, metadata: TagMetadata | None) -> str:
+    if _is_subject_tag(tag):
+        return "subject"
+    if metadata is not None and metadata.category in {3, 4}:
+        return "identity"
+    if _is_body_tag(tag):
+        return "body"
+    if _is_face_tag(tag):
+        return "face"
+    if _is_hair_head_tag(tag):
+        return "hair_head"
+    if _is_clothing_tag(tag) or _is_accessory_tag(tag):
+        return "clothes"
+    if _is_pose_tag(tag):
+        return "pose"
+    if _is_background_tag(tag):
+        return "background"
+    return "other"
+
+
+def _should_allow_metadata_by_default(instruction_ja: str, metadata: TagMetadata) -> bool:
+    if _is_denied_by_strict_policy(metadata.name):
+        return False
+    if metadata.category in EXPLICIT_ONLY_CATEGORIES and not _instruction_explicitly_mentions_tag(instruction_ja, metadata):
+        return False
+    return True
+
+
+def _person_count_value(tag: str) -> int | None:
+    if tag == "solo":
+        return 1
+    match = SUBJECT_COUNT_PATTERN.match(tag)
+    if match is not None:
+        return int(match.group("count"))
+    if tag.startswith("multiple_"):
+        return 2
+    if not any(token in tag for token in ("girl", "boy", "other")):
+        return None
+    numbers = [int(value) for value in re.findall(r"\d+", tag)]
+    if not numbers:
+        return None
+    return sum(numbers)
+
+
+def _filter_subject_conflicts(ordered_selected_tags: list[str]) -> list[str]:
+    explicit_subject_count = sum(
+        count
+        for tag in ordered_selected_tags
+        if tag != "solo" and (count := _person_count_value(tag)) is not None
+    )
+    inferred_count = explicit_subject_count
+    if inferred_count == 0 and any(tag.startswith("multiple_") for tag in ordered_selected_tags):
+        inferred_count = 2
+    if inferred_count <= 1:
+        return ordered_selected_tags
+    return [tag for tag in ordered_selected_tags if tag != "solo"]
+
+
+def _filter_breast_size_conflicts(ordered_selected_tags: list[str]) -> list[str]:
+    kept_tags: list[str] = []
+    seen_size = False
+    for tag in ordered_selected_tags:
+        if tag in BREAST_SIZE_TAGS:
+            if seen_size:
+                continue
+            seen_size = True
+        kept_tags.append(tag)
+    return kept_tags
+
+
+def _filter_background_conflicts(ordered_selected_tags: list[str]) -> list[str]:
+    kept_tags: list[str] = []
+    seen_specific_background = False
+    for tag in ordered_selected_tags:
+        color_prefix, base_tag = _split_color_tag(tag)
+        if base_tag == "background" and color_prefix is not None:
+            if seen_specific_background:
+                continue
+            seen_specific_background = True
+        kept_tags.append(tag)
+    return kept_tags
+
+
+def _apply_output_bucket_order(ordered_selected_tags: list[str], metadata_by_tag: dict[str, TagMetadata]) -> list[str]:
+    bucketed: dict[str, list[str]] = {bucket: [] for bucket in OUTPUT_BUCKET_ORDER}
+    for tag in ordered_selected_tags:
+        bucket = _classify_tag_bucket(tag, metadata_by_tag.get(tag))
+        bucketed.setdefault(bucket, []).append(tag)
+
+    ordered: list[str] = []
+    for bucket in OUTPUT_BUCKET_ORDER:
+        ordered.extend(bucketed.get(bucket, []))
+    return ordered
+
+
+def _build_candidate_lookup(candidate_tags: list[str]) -> dict[str, str]:
+    lookup: dict[str, str] = {}
+    for tag in candidate_tags:
+        lookup[_normalized_tag_key(tag)] = tag
+        lookup[_normalized_tag_key(_display_tag(tag))] = tag
+    return lookup
 
 
 class TagEmbeddingCatalog:
@@ -254,6 +605,7 @@ class TagEmbeddingCatalog:
         rescored: list[TagSearchResult] = []
         for similarity, metadata in candidates:
             score = self._score_candidate(
+                instruction_ja=instruction_ja,
                 metadata=metadata,
                 similarity=similarity,
                 profile=profile,
@@ -331,6 +683,7 @@ class TagEmbeddingCatalog:
 
     def _score_candidate(
         self,
+        instruction_ja: str,
         metadata: TagMetadata,
         similarity: float,
         profile: dict[int, float],
@@ -340,6 +693,11 @@ class TagEmbeddingCatalog:
         deprecated_penalty = -0.25 if metadata.is_deprecated else 0.0
         post_count_boost = min(0.18, math.log10(max(metadata.post_count, 1) + 1.0) * 0.03)
         exact_word_bonus = 0.03 if metadata.name in metadata.words else 0.0
+        strict_policy_penalty = 0.0
+        if not _should_allow_metadata_by_default(instruction_ja, metadata):
+            strict_policy_penalty -= 0.75
+        if _is_low_signal_tag(metadata.name):
+            strict_policy_penalty -= 0.28
         color_bonus = 0.0
         color_prefix, _ = _split_color_tag(metadata.name)
         if requested_colors and color_prefix is not None:
@@ -349,7 +707,14 @@ class TagEmbeddingCatalog:
                 color_bonus = -0.18
             else:
                 color_bonus = -0.06
-        return (similarity * category_weight) + post_count_boost + exact_word_bonus + deprecated_penalty + color_bonus
+        return (
+            (similarity * category_weight)
+            + post_count_boost
+            + exact_word_bonus
+            + deprecated_penalty
+            + strict_policy_penalty
+            + color_bonus
+        )
 
     def _build_index(self) -> TagIndex:
         source_signature = self._source_signature()
@@ -522,70 +887,6 @@ class TagEmbeddingCatalog:
         ).strip()
 
 
-class BonsaiChatNode:
-    CATEGORY = "LLM/Bonsai"
-    FUNCTION = "run"
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("tags",)
-
-    DEFAULT_SYSTEM_PROMPT = (
-        "あなたは画像生成向けタグ生成アシスタントです。"
-        "入力された日本語の指示を読み取り、内容に合う短いタグを英語中心で生成してください。"
-        "出力は1行のカンマ区切りタグのみとし、説明文、番号、改行、前置きは禁止です。"
-        "人物、構図、背景、色を含めてください。"
-    )
-
-    @classmethod
-    def INPUT_TYPES(cls) -> dict[str, dict[str, tuple[str, dict[str, object]]]]:
-        return {
-            "required": {
-                "instruction_ja": ("STRING", {"multiline": True, "default": ""}),
-                "system_prompt": (
-                    "STRING",
-                    {"multiline": True, "default": cls.DEFAULT_SYSTEM_PROMPT},
-                ),
-                "temperature": (
-                    "FLOAT",
-                    {"default": 0.4, "min": 0.0, "max": 2.0, "step": 0.1},
-                ),
-                "max_tokens": ("INT", {"default": 128, "min": 1, "max": 2048}),
-                "top_p": (
-                    "FLOAT",
-                    {"default": 0.9, "min": 0.0, "max": 1.0, "step": 0.01},
-                ),
-                "top_k": ("INT", {"default": 20, "min": 1, "max": 200}),
-            }
-        }
-
-    def run(
-        self,
-        instruction_ja: str,
-        system_prompt: str,
-        temperature: float,
-        max_tokens: int,
-        top_p: float,
-        top_k: int,
-    ) -> tuple[str]:
-        manager = BonsaiServerManager.instance()
-        text = manager.chat(
-            system_prompt=system_prompt,
-            user_prompt=self._build_user_prompt(instruction_ja),
-            temperature=temperature,
-            max_tokens=max_tokens,
-            top_p=top_p,
-            top_k=top_k,
-        )
-        return (_normalize_tags(text),)
-
-    @staticmethod
-    def _build_user_prompt(instruction_ja: str) -> str:
-        stripped = _validate_instruction(instruction_ja)
-        return (
-            "次の日本語指示を、画像生成向けのカンマ区切りタグへ変換してください。\n"
-            f"指示: {stripped}"
-        )
-
-
 class BonsaiCsvTagSelectorNode:
     CATEGORY = "LLM/Bonsai"
     FUNCTION = "run"
@@ -596,11 +897,12 @@ class BonsaiCsvTagSelectorNode:
     CONTEXT_MARGIN_TOKENS = 256
     MIN_CANDIDATE_COUNT = 8
     DEFAULT_SYSTEM_PROMPT = (
-        "あなたは tags.json の候補から画像生成タグを選ぶアシスタントです。"
+        "あなたは DeepDanbooru / Danbooru 形式のタグ選別アシスタントです。"
         "必ず候補一覧に含まれるタグだけを選んでください。"
         "候補にないタグを新規生成してはいけません。"
         "出力は1行のカンマ区切りタグのみとし、説明文、番号、改行、前置きは禁止です。"
-        "人物の基本属性、髪、服、表情、視線、構図、背景など、画像生成に有用な粒度で過不足なく選んでください。"
+        "品質タグ、画風タグ、artist/meta タグは、指示で明示されない限り選んではいけません。"
+        "題材に直接関係するタグだけを選び、人物属性、顔髪、服、ポーズ、背景を必要な範囲で過不足なく構成してください。"
     )
 
     @classmethod
@@ -638,42 +940,81 @@ class BonsaiCsvTagSelectorNode:
         top_k: int,
         rebuild_index: bool,
     ) -> tuple[str]:
+        tags = self._run_strict_selection(
+            instruction_ja=instruction_ja,
+            max_candidates=max_candidates,
+            max_selected_tags=max_selected_tags,
+            category_profile=category_profile,
+            temperature=temperature,
+            max_tokens=self.DEFAULT_MAX_TOKENS,
+            top_p=top_p,
+            top_k=top_k,
+            rebuild_index=rebuild_index,
+            auxiliary_prompt=None,
+        )
+        return (tags,)
+
+    @classmethod
+    def _run_strict_selection(
+        cls,
+        instruction_ja: str,
+        max_candidates: int,
+        max_selected_tags: int,
+        category_profile: str,
+        temperature: float,
+        max_tokens: int,
+        top_p: float,
+        top_k: int,
+        rebuild_index: bool,
+        auxiliary_prompt: str | None,
+    ) -> str:
         stripped_instruction = _validate_instruction(instruction_ja)
         if max_selected_tags < 1:
             raise ValueError("max_selected_tags は 1 以上にしてください。")
 
         catalog = TagEmbeddingCatalog.instance()
-        candidates = catalog.search(
+        searched_candidates = catalog.search(
             instruction_ja=stripped_instruction,
             limit=max_candidates,
             category_profile=category_profile,
             rebuild=bool(rebuild_index),
         )
+        candidates = cls._filter_candidates_for_prompt(
+            instruction_ja=stripped_instruction,
+            candidates=searched_candidates,
+        )
+        if not candidates:
+            raise RuntimeError("strict policy 適用後に候補タグが残りませんでした。")
+
         candidate_tags = [item.metadata.name for item in candidates]
+        metadata_by_tag = {item.metadata.name: item.metadata for item in candidates}
 
         manager = BonsaiServerManager.instance()
-        text = self._chat_with_retry(
+        text = cls._chat_with_retry(
             manager=manager,
             instruction_ja=stripped_instruction,
             candidates=candidates,
             max_selected_tags=max_selected_tags,
             category_profile=category_profile,
             temperature=temperature,
+            max_tokens=max_tokens,
             top_p=top_p,
             top_k=top_k,
+            auxiliary_prompt=auxiliary_prompt,
         )
 
-        normalized_tags = self._normalize_selected_tags(
+        normalized_tags = cls._normalize_selected_tags(
             text=text,
             instruction_ja=stripped_instruction,
             candidate_tags=candidate_tags,
+            metadata_by_tag=metadata_by_tag,
             max_selected_tags=max_selected_tags,
             catalog=catalog,
         )
         if not normalized_tags:
             raise RuntimeError("候補内のタグを選択できませんでした。")
         display_tags = [_display_tag(tag) for tag in normalized_tags]
-        return (",".join(display_tags),)
+        return ",".join(display_tags)
 
     @staticmethod
     def _build_candidate_line(item: TagSearchResult) -> str:
@@ -684,6 +1025,22 @@ class BonsaiCsvTagSelectorNode:
         )
 
     @classmethod
+    def _filter_candidates_for_prompt(
+        cls,
+        instruction_ja: str,
+        candidates: list[TagSearchResult],
+    ) -> list[TagSearchResult]:
+        filtered = [
+            item
+            for item in candidates
+            if _should_allow_metadata_by_default(instruction_ja, item.metadata)
+            and (not _is_low_signal_tag(item.metadata.name) or _instruction_explicitly_mentions_tag(instruction_ja, item.metadata))
+        ]
+        if filtered:
+            return filtered
+        return [item for item in candidates if not _is_denied_by_strict_policy(item.metadata.name)]
+
+    @classmethod
     def _chat_with_retry(
         cls,
         manager: BonsaiServerManager,
@@ -692,8 +1049,10 @@ class BonsaiCsvTagSelectorNode:
         max_selected_tags: int,
         category_profile: str,
         temperature: float,
+        max_tokens: int,
         top_p: float,
         top_k: int,
+        auxiliary_prompt: str | None,
     ) -> str:
         candidate_count = len(candidates)
         candidate_limit = candidate_count
@@ -708,6 +1067,8 @@ class BonsaiCsvTagSelectorNode:
                 candidates=prompt_candidates,
                 max_selected_tags=max_selected_tags,
                 category_profile=category_profile,
+                max_tokens=max_tokens,
+                auxiliary_prompt=auxiliary_prompt,
                 context_size_override=context_size_override,
             )
             try:
@@ -715,7 +1076,7 @@ class BonsaiCsvTagSelectorNode:
                     system_prompt=cls.DEFAULT_SYSTEM_PROMPT,
                     user_prompt=user_prompt,
                     temperature=temperature,
-                    max_tokens=cls.DEFAULT_MAX_TOKENS,
+                    max_tokens=max_tokens,
                     top_p=top_p,
                     top_k=top_k,
                 )
@@ -745,11 +1106,21 @@ class BonsaiCsvTagSelectorNode:
         candidates: list[TagSearchResult],
         max_selected_tags: int,
         category_profile: str,
+        max_tokens: int,
+        auxiliary_prompt: str | None,
         context_size_override: int | None = None,
     ) -> str:
         ctx_size = context_size_override if context_size_override is not None else manager.get_context_size()
         system_tokens = manager.estimate_token_count(cls.DEFAULT_SYSTEM_PROMPT)
-        fixed_tokens = system_tokens + cls.DEFAULT_MAX_TOKENS + cls.CONTEXT_MARGIN_TOKENS
+        fixed_tokens = system_tokens + max_tokens + cls.CONTEXT_MARGIN_TOKENS
+
+        auxiliary_section = ""
+        if auxiliary_prompt is not None and auxiliary_prompt.strip():
+            auxiliary_section = (
+                "補助指示:\n"
+                f"{auxiliary_prompt.strip()}\n"
+                "補助指示は参考情報であり、候補制約と禁止ルールより優先してはいけません。\n"
+            )
 
         prompt_header = (
             "次の日本語指示に合うタグを候補一覧から選んでください。\n"
@@ -758,9 +1129,12 @@ class BonsaiCsvTagSelectorNode:
             f"最大選択数: {max_selected_tags}\n"
             "ルール:\n"
             "- 候補一覧にあるタグだけを使う\n"
-            "- 指示に本当に必要なタグだけを選ぶ\n"
+            "- 指示に直接関係するタグだけを選ぶ\n"
+            "- 品質タグ、画風タグ、artist/meta タグは明示要求がない限り選ばない\n"
+            "- 人数/主題 -> 版権/キャラ -> 身体属性 -> 顔/目線 -> 髪/頭部 -> 服/装飾 -> ポーズ/構図 -> 背景の順で考える\n"
             "- 出力は1行のカンマ区切りタグのみ\n"
             "- category や post_count は参考情報であり、出力には含めない\n"
+            f"{auxiliary_section}"
             "候補一覧:\n"
         )
         prompt_tokens = manager.estimate_token_count(prompt_header)
@@ -772,17 +1146,35 @@ class BonsaiCsvTagSelectorNode:
 
         selected_lines: list[str] = []
         used_candidate_tokens = 0
-        for item in candidates:
-            line = cls._build_candidate_line(item)
-            line_tokens = manager.estimate_token_count(f"{line}\n")
-            if selected_lines and (used_candidate_tokens + line_tokens) > available_candidate_tokens:
-                break
-            if not selected_lines and line_tokens > available_candidate_tokens:
-                raise RuntimeError(
-                    "候補一覧を 1 件も収められません。config.json の ctx_size を増やしてください。"
-                )
-            selected_lines.append(line)
-            used_candidate_tokens += line_tokens
+        emitted_bucket_headers: set[str] = set()
+        grouped_candidates = cls._group_candidates_by_bucket(candidates)
+        for bucket in PROMPT_BUCKET_ORDER:
+            bucket_items = grouped_candidates.get(bucket, [])
+            if not bucket_items:
+                continue
+            header_line = f"[{PROMPT_BUCKET_LABELS[bucket]}]"
+            header_tokens = manager.estimate_token_count(f"{header_line}\n")
+            for item in bucket_items:
+                candidate_line = cls._build_candidate_line(item)
+                candidate_tokens = manager.estimate_token_count(f"{candidate_line}\n")
+                additional_tokens = candidate_tokens
+                lines_to_add: list[str] = []
+                if bucket not in emitted_bucket_headers:
+                    additional_tokens += header_tokens
+                    lines_to_add.append(header_line)
+                lines_to_add.append(candidate_line)
+
+                if selected_lines and (used_candidate_tokens + additional_tokens) > available_candidate_tokens:
+                    break
+                if not selected_lines and additional_tokens > available_candidate_tokens:
+                    raise RuntimeError(
+                        "候補一覧を 1 件も収められません。config.json の ctx_size を増やしてください。"
+                    )
+
+                if bucket not in emitted_bucket_headers:
+                    emitted_bucket_headers.add(bucket)
+                selected_lines.extend(lines_to_add)
+                used_candidate_tokens += additional_tokens
 
         if not selected_lines:
             raise RuntimeError("候補一覧を構築できませんでした。")
@@ -790,47 +1182,52 @@ class BonsaiCsvTagSelectorNode:
         return prompt_header + "\n".join(selected_lines)
 
     @staticmethod
-    def _build_user_prompt(
-        instruction_ja: str,
-        candidates: list[TagSearchResult],
-        max_selected_tags: int,
-        category_profile: str,
-    ) -> str:
-        candidate_lines = "\n".join(BonsaiCsvTagSelectorNode._build_candidate_line(item) for item in candidates)
-        return (
-            "次の日本語指示に合うタグを候補一覧から選んでください。\n"
-            f"指示: {instruction_ja}\n"
-            f"category_profile: {category_profile}\n"
-            f"最大選択数: {max_selected_tags}\n"
-            "ルール:\n"
-            "- 候補一覧にあるタグだけを使う\n"
-            "- 指示に本当に必要なタグだけを選ぶ\n"
-            "- 出力は1行のカンマ区切りタグのみ\n"
-            "- category や post_count は参考情報であり、出力には含めない\n"
-            "候補一覧:\n"
-            f"{candidate_lines}"
-        )
+    def _group_candidates_by_bucket(candidates: list[TagSearchResult]) -> dict[str, list[TagSearchResult]]:
+        grouped: dict[str, list[TagSearchResult]] = {bucket: [] for bucket in PROMPT_BUCKET_ORDER}
+        for item in candidates:
+            bucket = _classify_tag_bucket(item.metadata.name, item.metadata)
+            grouped.setdefault(bucket, []).append(item)
+        return grouped
 
     @staticmethod
     def _normalize_selected_tags(
         text: str,
         instruction_ja: str,
         candidate_tags: list[str],
+        metadata_by_tag: dict[str, TagMetadata],
         max_selected_tags: int,
         catalog: TagEmbeddingCatalog,
     ) -> list[str]:
         normalized_text = _normalize_tags(text)
         raw_tags = [part.strip() for part in normalized_text.split(",") if part.strip()]
-        display_to_tag = {_display_tag(tag): tag for tag in candidate_tags}
-        resolved_tags = [display_to_tag.get(tag, tag) for tag in raw_tags]
+        candidate_lookup = _build_candidate_lookup(candidate_tags)
+        resolved_tags = [candidate_lookup.get(_normalized_tag_key(tag), tag) for tag in raw_tags]
         valid_catalog_tags = catalog.filter_existing_tags(resolved_tags)
         candidate_tag_set = set(candidate_tags)
         ordered_selected_tags = [tag for tag in valid_catalog_tags if tag in candidate_tag_set]
+        strict_filtered_tags: list[str] = []
+        for tag in ordered_selected_tags:
+            metadata = metadata_by_tag.get(tag)
+            if metadata is None:
+                continue
+            if not _should_allow_metadata_by_default(instruction_ja, metadata):
+                continue
+            if _is_low_signal_tag(tag) and not _instruction_explicitly_mentions_tag(instruction_ja, metadata):
+                continue
+            strict_filtered_tags.append(tag)
+
         filtered_tags = BonsaiCsvTagSelectorNode._filter_conflicting_color_tags(
-            ordered_selected_tags=ordered_selected_tags,
+            ordered_selected_tags=strict_filtered_tags,
             instruction_ja=instruction_ja,
         )
-        return filtered_tags[:max_selected_tags]
+        filtered_tags = _filter_background_conflicts(filtered_tags)
+        filtered_tags = _filter_breast_size_conflicts(filtered_tags)
+        filtered_tags = _filter_subject_conflicts(filtered_tags)
+        ordered_output = _apply_output_bucket_order(
+            ordered_selected_tags=filtered_tags,
+            metadata_by_tag=metadata_by_tag,
+        )
+        return ordered_output[:max_selected_tags]
 
     @staticmethod
     def _filter_conflicting_color_tags(ordered_selected_tags: list[str], instruction_ja: str) -> list[str]:
@@ -853,3 +1250,71 @@ class BonsaiCsvTagSelectorNode:
                 continue
             kept_tags.append(tag)
         return kept_tags
+
+
+class BonsaiChatNode:
+    CATEGORY = "LLM/Bonsai"
+    FUNCTION = "run"
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("tags",)
+
+    DEFAULT_MAX_CANDIDATES = 256
+    DEFAULT_MAX_SELECTED_TAGS = 32
+    DEFAULT_CATEGORY_PROFILE = "balanced"
+    DEFAULT_SYSTEM_PROMPT = (
+        "DeepDanbooru 風に、題材へ直接関係する tags.json 内のタグだけを優先してください。"
+        "品質タグ、画風タグ、不要な補助語は入れず、主題から背景まで筋の通ったタグ列にしてください。"
+    )
+
+    @classmethod
+    def INPUT_TYPES(cls) -> dict[str, dict[str, tuple[str, dict[str, object]]]]:
+        return {
+            "required": {
+                "instruction_ja": ("STRING", {"multiline": True, "default": ""}),
+                "system_prompt": (
+                    "STRING",
+                    {"multiline": True, "default": cls.DEFAULT_SYSTEM_PROMPT},
+                ),
+                "temperature": (
+                    "FLOAT",
+                    {"default": 0.4, "min": 0.0, "max": 2.0, "step": 0.1},
+                ),
+                "max_tokens": ("INT", {"default": 128, "min": 1, "max": 2048}),
+                "top_p": (
+                    "FLOAT",
+                    {"default": 0.9, "min": 0.0, "max": 1.0, "step": 0.01},
+                ),
+                "top_k": ("INT", {"default": 20, "min": 1, "max": 200}),
+            }
+        }
+
+    def run(
+        self,
+        instruction_ja: str,
+        system_prompt: str,
+        temperature: float,
+        max_tokens: int,
+        top_p: float,
+        top_k: int,
+    ) -> tuple[str]:
+        auxiliary_prompt = self._normalize_auxiliary_prompt(system_prompt)
+        tags = BonsaiCsvTagSelectorNode._run_strict_selection(
+            instruction_ja=instruction_ja,
+            max_candidates=self.DEFAULT_MAX_CANDIDATES,
+            max_selected_tags=self.DEFAULT_MAX_SELECTED_TAGS,
+            category_profile=self.DEFAULT_CATEGORY_PROFILE,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            top_p=top_p,
+            top_k=top_k,
+            rebuild_index=False,
+            auxiliary_prompt=auxiliary_prompt,
+        )
+        return (tags,)
+
+    @classmethod
+    def _normalize_auxiliary_prompt(cls, system_prompt: str) -> str | None:
+        stripped = system_prompt.strip()
+        if not stripped or stripped == cls.DEFAULT_SYSTEM_PROMPT:
+            return None
+        return stripped

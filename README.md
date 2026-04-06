@@ -47,7 +47,7 @@ ComfyUI 上では `Bonsai Tag Generator` として表示されます。
 入力:
 
 - `instruction_ja`: 日本語の指示文
-- `system_prompt`: タグ生成ルール。既定値はタグ専用
+- `system_prompt`: 補助指示。互換入力として残していますが、候補制約と strict policy を上書きしません
 - `temperature`
 - `max_tokens`
 - `top_p`
@@ -59,8 +59,8 @@ ComfyUI 上では `Bonsai Tag Generator` として表示されます。
 
 想定用途:
 
-- 日本語のプロンプト案から画像生成用タグを作る
-- 構図、人物、背景、雰囲気、品質タグを Bonsai で補完する
+- 日本語の指示文から、DeepDanbooru / Danbooru 風の題材直結タグ列を作る
+- `tags.json` の候補から、品質タグや画風タグを混ぜずに整ったタグ列を得る
 
 ### Bonsai Semantic Tag Selector
 
@@ -87,15 +87,16 @@ ComfyUI 上では `Bonsai Semantic Tag Selector` として表示されます。
 - 初回実行時に `intfloat/multilingual-e5-small` でタグ埋め込み索引を生成し、`tag_index_meta.json` と `tag_index_vectors.npz` を保存します
 - 2 回目以降は保存済み索引を再利用し、`tags.json` 更新時または `rebuild_index=true` のときだけ再生成します
 - 日本語指示を埋め込みベクトル化し、類似度で上位候補を取得します
-- その後 `category_profile`, `post_count`, `is_deprecated` に加え、指示文中の色指定を使って再ランクします
+- その後 `category_profile`, `post_count`, `is_deprecated`, strict policy, 指示文中の色指定を使って再ランクします
 - Bonsai は候補一覧からのみタグを選択します
-- 最終選択の順序は Bonsai の出力順を維持します
-- 最終出力では `tags.json` に存在しないタグ、候補外タグ、重複タグを除外し、色指定と矛盾する衣装色タグを整理します
+- 候補一覧は主題、顔髪、服、ポーズ、背景の bucket ごとに整理して渡します
+- 最終出力では `tags.json` に存在しないタグ、候補外タグ、重複タグ、品質タグ、画風タグ、artist/meta タグ、明白な競合タグを整理します
+- 出力順は `subject count/focus -> character/copyright -> body/global attributes -> face/expression/eyes -> hair/head -> clothes/accessories -> pose/composition -> background/environment` に固定します
 
 既存ノードとの違い:
 
-- `Bonsai Tag Generator` はタグを自由生成します
-- `Bonsai Semantic Tag Selector` は `tags.json` にあるタグだけを返します
+- `Bonsai Tag Generator` は簡易インターフェースで strict pipeline を使います
+- `Bonsai Semantic Tag Selector` は候補数やカテゴリ重みを調整できる詳細版です
 
 注意:
 
@@ -104,6 +105,7 @@ ComfyUI 上では `Bonsai Semantic Tag Selector` として表示されます。
 - `sentence-transformers`, `torch`, `numpy` が必要です
 - 最終的に候補が抽出できない場合はエラーになります
 - 埋め込み索引は初回読み込み後にメモリへ保持されます
+- 既定では品質タグ、画風タグ、artist/meta タグは自動挿入しません
 
 追加ルート:
 
