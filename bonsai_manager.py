@@ -166,6 +166,17 @@ class BonsaiServerManager:
             "error": self._config_error,
         }
 
+    def get_context_size(self) -> int:
+        config = self._load_config()
+        return config.ctx_size
+
+    @staticmethod
+    def estimate_token_count(text: str) -> int:
+        if not text:
+            return 0
+        utf8_length = len(text.encode("utf-8"))
+        return max(1, (utf8_length + 2) // 3)
+
     def chat(
         self,
         system_prompt: str,

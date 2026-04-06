@@ -494,6 +494,7 @@ class BonsaiCsvTagSelectorNode:
     DEFAULT_MAX_TOKENS = 128
     DEFAULT_TOP_P = 0.9
     DEFAULT_TOP_K = 20
+    CONTEXT_MARGIN_TOKENS = 256
     DEFAULT_SYSTEM_PROMPT = (
         "あなたは tags.json の候補から画像生成タグを選ぶアシスタントです。"
         "必ず候補一覧に含まれるタグだけを選んでください。"
@@ -538,14 +539,16 @@ class BonsaiCsvTagSelectorNode:
         candidate_tags = [item.metadata.name for item in candidates]
 
         manager = BonsaiServerManager.instance()
+        user_prompt = self._build_fitted_user_prompt(
+            manager=manager,
+            instruction_ja=stripped_instruction,
+            candidates=candidates,
+            max_selected_tags=max_selected_tags,
+            category_profile=category_profile,
+        )
         text = manager.chat(
             system_prompt=self.DEFAULT_SYSTEM_PROMPT,
-            user_prompt=self._build_user_prompt(
-                instruction_ja=stripped_instruction,
-                candidates=candidates,
-                max_selected_tags=max_selected_tags,
-                category_profile=category_profile,
-            ),
+            user_prompt=user_prompt,
             temperature=self.DEFAULT_TEMPERATURE,
             max_tokens=self.DEFAULT_MAX_TOKENS,
             top_p=self.DEFAULT_TOP_P,
@@ -563,16 +566,72 @@ class BonsaiCsvTagSelectorNode:
         return (",".join(normalized_tags),)
 
     @staticmethod
+    def _build_candidate_line(item: TagSearchResult) -> str:
+        return (
+            f"- {item.metadata.name} | "
+            f"category={TagEmbeddingCatalog.CATEGORY_LABELS.get(item.metadata.category, 'other')} | "
+            f"post_count={item.metadata.post_count}"
+        )
+
+    @classmethod
+    def _build_fitted_user_prompt(
+        cls,
+        manager: BonsaiServerManager,
+        instruction_ja: str,
+        candidates: list[TagSearchResult],
+        max_selected_tags: int,
+        category_profile: str,
+    ) -> str:
+        ctx_size = manager.get_context_size()
+        system_tokens = manager.estimate_token_count(cls.DEFAULT_SYSTEM_PROMPT)
+        fixed_tokens = system_tokens + cls.DEFAULT_MAX_TOKENS + cls.CONTEXT_MARGIN_TOKENS
+
+        prompt_header = (
+            "次の日本語指示に合うタグを候補一覧から選んでください。\n"
+            f"指示: {instruction_ja}\n"
+            f"category_profile: {category_profile}\n"
+            f"最大選択数: {max_selected_tags}\n"
+            "ルール:\n"
+            "- 候補一覧にあるタグだけを使う\n"
+            "- 指示に本当に必要なタグだけを選ぶ\n"
+            "- 出力は1行のカンマ区切りタグのみ\n"
+            "- category や post_count は参考情報であり、出力には含めない\n"
+            "候補一覧:\n"
+        )
+        prompt_tokens = manager.estimate_token_count(prompt_header)
+        available_candidate_tokens = ctx_size - fixed_tokens - prompt_tokens
+        if available_candidate_tokens <= 0:
+            raise RuntimeError(
+                "Bonsai のコンテキスト長が不足しています。config.json の ctx_size を増やすか、入力文を短くしてください。"
+            )
+
+        selected_lines: list[str] = []
+        used_candidate_tokens = 0
+        for item in candidates:
+            line = cls._build_candidate_line(item)
+            line_tokens = manager.estimate_token_count(f"{line}\n")
+            if selected_lines and (used_candidate_tokens + line_tokens) > available_candidate_tokens:
+                break
+            if not selected_lines and line_tokens > available_candidate_tokens:
+                raise RuntimeError(
+                    "候補一覧を 1 件も収められません。config.json の ctx_size を増やしてください。"
+                )
+            selected_lines.append(line)
+            used_candidate_tokens += line_tokens
+
+        if not selected_lines:
+            raise RuntimeError("候補一覧を構築できませんでした。")
+
+        return prompt_header + "\n".join(selected_lines)
+
+    @staticmethod
     def _build_user_prompt(
         instruction_ja: str,
         candidates: list[TagSearchResult],
         max_selected_tags: int,
         category_profile: str,
     ) -> str:
-        candidate_lines = "\n".join(
-            f"- {item.metadata.name} | category={TagEmbeddingCatalog.CATEGORY_LABELS.get(item.metadata.category, 'other')} | post_count={item.metadata.post_count}"
-            for item in candidates
-        )
+        candidate_lines = "\n".join(BonsaiCsvTagSelectorNode._build_candidate_line(item) for item in candidates)
         return (
             "次の日本語指示に合うタグを候補一覧から選んでください。\n"
             f"指示: {instruction_ja}\n"
