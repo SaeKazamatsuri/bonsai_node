@@ -1,0 +1,7 @@
+[project]
+name = "bonsai-node"
+version = "0.1.0"
+description = "ComfyUI custom node that manages a Bonsai llama-server lifecycle"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
