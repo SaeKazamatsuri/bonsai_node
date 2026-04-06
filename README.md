@@ -72,6 +72,9 @@ ComfyUI 上では `Bonsai Semantic Tag Selector` として表示されます。
 - `max_candidates`: `tags.json` から Bonsai に渡す候補数上限
 - `max_selected_tags`: 最終的に返すタグ数上限
 - `category_profile`: 再ランク時のカテゴリ重み。`balanced` / `character_focus` / `style_pose_focus`
+- `temperature`: 最終タグ選択時の多様性
+- `top_p`
+- `top_k`
 - `rebuild_index`: `true` のとき埋め込み索引を再構築
 
 出力:
@@ -86,6 +89,7 @@ ComfyUI 上では `Bonsai Semantic Tag Selector` として表示されます。
 - 日本語指示を埋め込みベクトル化し、類似度で上位候補を取得します
 - その後 `category_profile`, `post_count`, `is_deprecated` に加え、指示文中の色指定を使って再ランクします
 - Bonsai は候補一覧からのみタグを選択します
+- 最終選択の順序は Bonsai の出力順を維持します
 - 最終出力では `tags.json` に存在しないタグ、候補外タグ、重複タグを除外し、色指定と矛盾する衣装色タグを整理します
 
 既存ノードとの違い:

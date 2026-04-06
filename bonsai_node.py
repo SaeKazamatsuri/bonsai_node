@@ -592,10 +592,7 @@ class BonsaiCsvTagSelectorNode:
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("tags",)
 
-    DEFAULT_TEMPERATURE = 0.2
     DEFAULT_MAX_TOKENS = 128
-    DEFAULT_TOP_P = 0.9
-    DEFAULT_TOP_K = 20
     CONTEXT_MARGIN_TOKENS = 256
     MIN_CANDIDATE_COUNT = 8
     DEFAULT_SYSTEM_PROMPT = (
@@ -603,6 +600,7 @@ class BonsaiCsvTagSelectorNode:
         "必ず候補一覧に含まれるタグだけを選んでください。"
         "候補にないタグを新規生成してはいけません。"
         "出力は1行のカンマ区切りタグのみとし、説明文、番号、改行、前置きは禁止です。"
+        "人物の基本属性、髪、服、表情、視線、構図、背景など、画像生成に有用な粒度で過不足なく選んでください。"
     )
 
     @classmethod
@@ -616,6 +614,15 @@ class BonsaiCsvTagSelectorNode:
                     TagEmbeddingCatalog.category_profile_names(),
                     {"default": "balanced"},
                 ),
+                "temperature": (
+                    "FLOAT",
+                    {"default": 0.55, "min": 0.0, "max": 2.0, "step": 0.05},
+                ),
+                "top_p": (
+                    "FLOAT",
+                    {"default": 0.95, "min": 0.0, "max": 1.0, "step": 0.01},
+                ),
+                "top_k": ("INT", {"default": 40, "min": 1, "max": 200}),
                 "rebuild_index": ("BOOLEAN", {"default": False}),
             }
         }
@@ -626,6 +633,9 @@ class BonsaiCsvTagSelectorNode:
         max_candidates: int,
         max_selected_tags: int,
         category_profile: str,
+        temperature: float,
+        top_p: float,
+        top_k: int,
         rebuild_index: bool,
     ) -> tuple[str]:
         stripped_instruction = _validate_instruction(instruction_ja)
@@ -648,6 +658,9 @@ class BonsaiCsvTagSelectorNode:
             candidates=candidates,
             max_selected_tags=max_selected_tags,
             category_profile=category_profile,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
         )
 
         normalized_tags = self._normalize_selected_tags(
@@ -678,6 +691,9 @@ class BonsaiCsvTagSelectorNode:
         candidates: list[TagSearchResult],
         max_selected_tags: int,
         category_profile: str,
+        temperature: float,
+        top_p: float,
+        top_k: int,
     ) -> str:
         candidate_count = len(candidates)
         candidate_limit = candidate_count
@@ -698,10 +714,10 @@ class BonsaiCsvTagSelectorNode:
                 return manager.chat(
                     system_prompt=cls.DEFAULT_SYSTEM_PROMPT,
                     user_prompt=user_prompt,
-                    temperature=cls.DEFAULT_TEMPERATURE,
+                    temperature=temperature,
                     max_tokens=cls.DEFAULT_MAX_TOKENS,
-                    top_p=cls.DEFAULT_TOP_P,
-                    top_k=cls.DEFAULT_TOP_K,
+                    top_p=top_p,
+                    top_k=top_k,
                 )
             except BonsaiContextSizeError as exc:
                 last_error = exc
@@ -809,13 +825,12 @@ class BonsaiCsvTagSelectorNode:
         resolved_tags = [display_to_tag.get(tag, tag) for tag in raw_tags]
         valid_catalog_tags = catalog.filter_existing_tags(resolved_tags)
         candidate_tag_set = set(candidate_tags)
-        selected_tag_set = {tag for tag in valid_catalog_tags if tag in candidate_tag_set}
-        ordered_selected_tags = [tag for tag in candidate_tags if tag in selected_tag_set]
-        resolved_tags = BonsaiCsvTagSelectorNode._filter_conflicting_color_tags(
+        ordered_selected_tags = [tag for tag in valid_catalog_tags if tag in candidate_tag_set]
+        filtered_tags = BonsaiCsvTagSelectorNode._filter_conflicting_color_tags(
             ordered_selected_tags=ordered_selected_tags,
             instruction_ja=instruction_ja,
         )
-        return resolved_tags[:max_selected_tags]
+        return filtered_tags[:max_selected_tags]
 
     @staticmethod
     def _filter_conflicting_color_tags(ordered_selected_tags: list[str], instruction_ja: str) -> list[str]:
