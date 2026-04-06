@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .bonsai_manager import BonsaiServerManager
+from .bonsai_manager import BonsaiContextSizeError, BonsaiServerManager
 
 if TYPE_CHECKING:
     import numpy as np
@@ -495,6 +495,7 @@ class BonsaiCsvTagSelectorNode:
     DEFAULT_TOP_P = 0.9
     DEFAULT_TOP_K = 20
     CONTEXT_MARGIN_TOKENS = 256
+    MIN_CANDIDATE_COUNT = 8
     DEFAULT_SYSTEM_PROMPT = (
         "あなたは tags.json の候補から画像生成タグを選ぶアシスタントです。"
         "必ず候補一覧に含まれるタグだけを選んでください。"
@@ -539,20 +540,12 @@ class BonsaiCsvTagSelectorNode:
         candidate_tags = [item.metadata.name for item in candidates]
 
         manager = BonsaiServerManager.instance()
-        user_prompt = self._build_fitted_user_prompt(
+        text = self._chat_with_retry(
             manager=manager,
             instruction_ja=stripped_instruction,
             candidates=candidates,
             max_selected_tags=max_selected_tags,
             category_profile=category_profile,
-        )
-        text = manager.chat(
-            system_prompt=self.DEFAULT_SYSTEM_PROMPT,
-            user_prompt=user_prompt,
-            temperature=self.DEFAULT_TEMPERATURE,
-            max_tokens=self.DEFAULT_MAX_TOKENS,
-            top_p=self.DEFAULT_TOP_P,
-            top_k=self.DEFAULT_TOP_K,
         )
 
         normalized_tags = self._normalize_selected_tags(
@@ -574,7 +567,7 @@ class BonsaiCsvTagSelectorNode:
         )
 
     @classmethod
-    def _build_fitted_user_prompt(
+    def _chat_with_retry(
         cls,
         manager: BonsaiServerManager,
         instruction_ja: str,
@@ -582,7 +575,59 @@ class BonsaiCsvTagSelectorNode:
         max_selected_tags: int,
         category_profile: str,
     ) -> str:
-        ctx_size = manager.get_context_size()
+        candidate_count = len(candidates)
+        candidate_limit = candidate_count
+        context_size_override: int | None = None
+        last_error: BonsaiContextSizeError | None = None
+
+        while candidate_limit >= 1:
+            prompt_candidates = candidates[:candidate_limit]
+            user_prompt = cls._build_fitted_user_prompt(
+                manager=manager,
+                instruction_ja=instruction_ja,
+                candidates=prompt_candidates,
+                max_selected_tags=max_selected_tags,
+                category_profile=category_profile,
+                context_size_override=context_size_override,
+            )
+            try:
+                return manager.chat(
+                    system_prompt=cls.DEFAULT_SYSTEM_PROMPT,
+                    user_prompt=user_prompt,
+                    temperature=cls.DEFAULT_TEMPERATURE,
+                    max_tokens=cls.DEFAULT_MAX_TOKENS,
+                    top_p=cls.DEFAULT_TOP_P,
+                    top_k=cls.DEFAULT_TOP_K,
+                )
+            except BonsaiContextSizeError as exc:
+                last_error = exc
+                context_size_override = exc.context_size
+                next_limit = min(
+                    candidate_limit - 1,
+                    max(cls.MIN_CANDIDATE_COUNT, (candidate_limit * exc.context_size) // max(exc.prompt_tokens, 1)),
+                )
+                if next_limit >= candidate_limit:
+                    next_limit = candidate_limit - 1
+                candidate_limit = next_limit
+
+        if last_error is not None:
+            raise RuntimeError(
+                "Bonsai の実コンテキスト長に合わせて候補数を削減しても収まりませんでした。"
+                "instruction_ja を短くするか、サーバー側の ctx_size をさらに増やしてください。"
+            ) from last_error
+        raise RuntimeError("Bonsai へのリクエスト生成に失敗しました。")
+
+    @classmethod
+    def _build_fitted_user_prompt(
+        cls,
+        manager: BonsaiServerManager,
+        instruction_ja: str,
+        candidates: list[TagSearchResult],
+        max_selected_tags: int,
+        category_profile: str,
+        context_size_override: int | None = None,
+    ) -> str:
+        ctx_size = context_size_override if context_size_override is not None else manager.get_context_size()
         system_tokens = manager.estimate_token_count(cls.DEFAULT_SYSTEM_PROMPT)
         fixed_tokens = system_tokens + cls.DEFAULT_MAX_TOKENS + cls.CONTEXT_MARGIN_TOKENS
 

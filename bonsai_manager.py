@@ -79,6 +79,16 @@ class BonsaiConfig:
         )
 
 
+@dataclass(frozen=True)
+class BonsaiContextSizeError(RuntimeError):
+    message: str
+    prompt_tokens: int
+    context_size: int
+
+    def __str__(self) -> str:
+        return self.message
+
+
 class BonsaiServerManager:
     _instance: "BonsaiServerManager | None" = None
     _instance_lock = threading.Lock()
@@ -213,12 +223,46 @@ class BonsaiServerManager:
                 body = response.read().decode("utf-8")
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
+            context_size_error = self._parse_context_size_error(detail)
+            if context_size_error is not None:
+                raise context_size_error from exc
             raise RuntimeError(f"Bonsai サーバー HTTP エラー: {exc.code} {detail}") from exc
         except urllib.error.URLError as exc:
             raise RuntimeError(f"Bonsai サーバーに接続できません: {exc}") from exc
 
         parsed = json.loads(body)
         return self._extract_content(parsed)
+
+    @staticmethod
+    def _parse_context_size_error(detail: str) -> BonsaiContextSizeError | None:
+        try:
+            parsed = json.loads(detail)
+        except json.JSONDecodeError:
+            return None
+
+        if not isinstance(parsed, dict):
+            return None
+        error = parsed.get("error")
+        if not isinstance(error, dict):
+            return None
+
+        error_type = error.get("type")
+        message = error.get("message")
+        prompt_tokens = error.get("n_prompt_tokens")
+        context_size = error.get("n_ctx")
+        if (
+            error_type != "exceed_context_size_error"
+            or not isinstance(message, str)
+            or not isinstance(prompt_tokens, int)
+            or not isinstance(context_size, int)
+        ):
+            return None
+
+        return BonsaiContextSizeError(
+            message=f"Bonsai サーバー HTTP エラー: 400 {detail}",
+            prompt_tokens=prompt_tokens,
+            context_size=context_size,
+        )
 
     def _load_config(self) -> BonsaiConfig:
         try:
