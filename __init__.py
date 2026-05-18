@@ -3,6 +3,8 @@ from .bonsai_node import BonsaiChatNode, BonsaiCsvTagSelectorNode, BonsaiDirectT
 
 setup_bonsai_lifecycle()
 
+WEB_DIRECTORY = "./web"
+
 NODE_CLASS_MAPPINGS = {
     "BonsaiChatNode": BonsaiChatNode,
     "BonsaiCsvTagSelectorNode": BonsaiCsvTagSelectorNode,

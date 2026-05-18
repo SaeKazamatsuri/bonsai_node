@@ -364,7 +364,6 @@ class BonsaiServerManager:
 
 def setup_bonsai_lifecycle() -> None:
     manager = BonsaiServerManager.instance()
-    manager.warmup_async()
 
     prompt_server = _get_prompt_server_instance()
     if prompt_server is not None:
@@ -417,6 +416,11 @@ def _register_routes(prompt_server: object, manager: BonsaiServerManager) -> Non
 
     @routes.get("/bonsai/status")
     async def bonsai_status(_: object) -> "web.Response":
+        return web.json_response(manager.status())
+
+    @routes.post("/bonsai/start")
+    async def bonsai_start(_: object) -> "web.Response":
+        manager.ensure_started(wait=True)
         return web.json_response(manager.status())
 
     @routes.post("/bonsai/restart")

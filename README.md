@@ -1,6 +1,6 @@
 # bonsai_node
 
-ComfyUI の custom node として配置し、ComfyUI 起動時に Bonsai 用 `llama-server` を自動起動し、ComfyUI 終了時に停止します。
+ComfyUI の custom node として配置し、Bonsai ノードをワークフローに追加したタイミングで Bonsai 用 `llama-server` を起動し、ComfyUI 終了時に停止します。
 
 ## 使い方
 
@@ -133,4 +133,5 @@ ComfyUI 上では `Bonsai Semantic Tag Selector` として表示されます。
 追加ルート:
 
 - `GET /bonsai/status`
+- `POST /bonsai/start`
 - `POST /bonsai/restart`
